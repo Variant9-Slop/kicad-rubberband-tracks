@@ -1,0 +1,2 @@
+-r plugin/requirements.txt
+pytest

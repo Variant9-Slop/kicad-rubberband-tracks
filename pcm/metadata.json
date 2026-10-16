@@ -1,0 +1,15 @@
+{
+  "$schema": "https://go.kicad.org/pcm/schemas/v1",
+  "name": "Rubber Band Tracks",
+  "description": "Pull selected track segments taut around other copper.",
+  "description_full": "Select track segments and click the toolbar button. Each selected run is replaced by the shortest path that passes every obstacle on the same side as before. Ends stay fixed at pads, vias, branches and unselected tracks.",
+  "identifier": "local.hobby.rubberband-tracks",
+  "type": "plugin",
+  "runtime": "ipc",
+  "author": { "name": "Variant", "contact": {} },
+  "license": "MIT",
+  "resources": {},
+  "versions": [
+    { "version": "0.5.0", "status": "testing", "kicad_version": "9.0" }
+  ]
+}
