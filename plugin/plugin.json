@@ -1,12 +1,12 @@
 {
   "$schema": "https://go.kicad.org/api/schemas/v1",
-  "identifier": "local.hobby.rubberband-tracks",
+  "identifier": "dev.variant9.rubberband-tracks",
   "name": "Rubber Band Tracks",
   "description": "Pull selected track segments taut around other copper, keeping the side they pass each obstacle on.",
   "runtime": { "type": "python" },
   "actions": [
     {
-      "identifier": "local.hobby.rubberband-tracks.pull",
+      "identifier": "dev.variant9.rubberband-tracks.pull",
       "name": "Rubber band selected tracks",
       "description": "Shorten and straighten the selected track segments",
       "show-button": true,

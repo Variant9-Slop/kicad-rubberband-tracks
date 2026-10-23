@@ -36,8 +36,6 @@ Units are nanometres throughout (KiCad's internal unit).
 
 ## Constraints and gotchas
 
-- Plugin identifier must have ≥3 dot-separated parts (`local.hobby.rubberband-tracks`),
-  or KiCad silently rejects it ("identifier ... does not meet requirements").
 - Do not use `board.begin_commit()` / `push_commit()`: `BeginCommit` carries no document,
   and KiCad 10 can route it to the schematic editor's handler, which crashes KiCad
   (`API_HANDLER_EDITOR::checkForBusy` in `_eeschema.kiface`). Writes are two requests

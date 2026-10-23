@@ -3,7 +3,7 @@
   "name": "Rubber Band Tracks",
   "description": "Pull selected track segments taut around other copper.",
   "description_full": "Select track segments and click the toolbar button. Each selected run is replaced by the shortest path that passes every obstacle on the same side as before. Ends stay fixed at pads, vias, branches and unselected tracks.",
-  "identifier": "local.hobby.rubberband-tracks",
+  "identifier": "dev.variant9.rubberband-tracks",
   "type": "plugin",
   "runtime": "ipc",
   "author": { "name": "Variant", "contact": {} },
