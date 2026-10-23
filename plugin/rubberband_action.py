@@ -367,10 +367,11 @@ class RubberBand:
             pad_polys = self._pads_by_net(layer).get(net, [])
 
             def fixed(n):
-                if len(nodes[n]) != 2 or n in anchors:
-                    return True
+                return len(nodes[n]) != 2 or n in anchors
+
+            def pads_at(n):
                 p = Point(n)
-                return any(poly.covers(p) for poly in pad_polys)
+                return {i for i, poly in enumerate(pad_polys) if poly.covers(p)}
 
             used = set()
             for n in list(nodes):
@@ -380,7 +381,7 @@ class RubberBand:
                     if t.id.value in used:
                         continue
                     chain, cur, seg = [], n, t
-                    pts = [n]
+                    pts, joints = [n], [n]
                     while True:
                         used.add(seg.id.value)
                         chain.append(seg)
@@ -389,12 +390,23 @@ class RubberBand:
                             sp = sp[::-1]
                         pts.extend(sp[1:])
                         cur = _xy(seg.end) if _xy(seg.start) == cur else _xy(seg.start)
+                        joints.append(cur)
                         if fixed(cur):
                             break
                         seg = next((s for s in nodes[cur] if s.id.value not in used), None)
                         if seg is None:
                             break
-                    result.append((layer, net, width, chain, pts))
+                    # A run that passes through another pad of its net must keep touching it,
+                    # so split there. Bends inside the pads the run ends in (even just on
+                    # their edge) are free: the run is connected to those pads anyway.
+                    end_pads = pads_at(joints[0]) | pads_at(joints[-1])
+                    start_seg, start_pt = 0, 0
+                    for k in range(1, len(chain)):
+                        if pads_at(joints[k]) - end_pads:
+                            end_pt = pts.index(joints[k], start_pt + 1)
+                            result.append((layer, net, width, chain[start_seg:k], pts[start_pt:end_pt + 1]))
+                            start_seg, start_pt = k, end_pt
+                    result.append((layer, net, width, chain[start_seg:], pts[start_pt:]))
             if len(used) < len(items):
                 self.messages.append(f"{len(items) - len(used)} segment(s) form a closed loop; skipped")
         return result

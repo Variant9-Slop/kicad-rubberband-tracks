@@ -82,3 +82,23 @@ def test_nested_nets_settle_regardless_of_order(tmp_path):
     path_b = LineString(created_path(b, "B"))
     assert max(y for _, y in path_b.coords) < 0.6       # B pulled down onto A
     assert path_b.distance(LineString([(0, 0), (10, 0)])) >= 0.45 - 1e-6
+
+
+def test_bend_on_edge_of_end_pad_is_not_fixed(tmp_path):
+    # Last bend sits exactly on the edge of the pad the run ends in (C11 -> SW2 on
+    # GbaCartBreakout): it must not split off the final segment.
+    segs = [track((0, 0), (1.1, 1.1)), track((1.1, 1.1), (6.4625, 1.1)),
+            track((6.4625, 1.1), (6.8625, 0.7))]
+    b = MockBoard(tmp_path, tracks=segs, selection=segs,
+                  pads=[pad(0, 0, "A", 1.075, 0.95), pad(6.8625, 0.7, "A", 2, 0.8)])
+    assert run(b).messages == []
+    assert created_path(b) == [(0, 0), (6.8625, 0.7)]
+    assert len(b.removed) == 3
+
+
+def test_bend_inside_pad_mid_run_stays_fixed(tmp_path):
+    # A run that passes through another pad of its net keeps touching it.
+    segs = [track((0, 0), (5, 3)), track((5, 3), (10, 0))]
+    b = MockBoard(tmp_path, tracks=segs, selection=segs,
+                  pads=[pad(0, 0, "A"), pad(5, 3, "A"), pad(10, 0, "A")])
+    assert run(b).messages == ["Nothing to change: selection is already taut."]

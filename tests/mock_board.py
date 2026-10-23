@@ -41,14 +41,16 @@ def track(a, b, net_name="A", width=0.25):
     return t
 
 
-def pad(x, y, net_name, size=1.0):
-    """Square SMD pad; its polygon is served by get_pad_shapes_as_polygons."""
+def pad(x, y, net_name, size=1.0, height=None):
+    """Rectangular SMD pad (square unless height is given); its polygon is served by
+    get_pad_shapes_as_polygons."""
+    height = size if height is None else height
     p = _set_id(Pad())
     p.position = _v(x, y)
     p.net = net(net_name)
     outline = PolyLine()
-    for cx, cy in box((x - size / 2) * MM, (y - size / 2) * MM,
-                      (x + size / 2) * MM, (y + size / 2) * MM).exterior.coords[:-1]:
+    for cx, cy in box((x - size / 2) * MM, (y - height / 2) * MM,
+                      (x + size / 2) * MM, (y + height / 2) * MM).exterior.coords[:-1]:
         outline.append(PolyLineNode.from_xy(int(cx), int(cy)))
     poly = PolygonWithHoles()
     poly.outline = outline
