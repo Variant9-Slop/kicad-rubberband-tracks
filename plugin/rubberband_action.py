@@ -29,7 +29,7 @@ from kipy.geometry import Vector2, arc_center
 from kipy.proto.board import board_types_pb2
 from kipy.proto.common.types import KiCadObjectType
 
-from rubberband_core import RubberBandError, path_length, pull_taut
+from rubberband_core import RubberBandError, fit_arcs, path_length, pull_taut
 
 # ------------------------------------------------------------------ settings (nm)
 EXTRA_MARGIN = 0               # added on top of every clearance (use for custom DRC rules)
@@ -42,6 +42,8 @@ AVOID_COPPER_ZONES = False     # False: zones of other nets are ignored (they re
 ARC_MAX_ERROR = 1_000          # chord error when turning arcs into segments
 PAD_POLY_ERROR = 5_000         # KiCad's own polygon approximation error for round pads
 QUAD_SEGS = 32                 # circle resolution for Edge.Cuts circles
+USE_ARCS = True                # round the corners around vias, pad corners etc. with arcs
+ARC_MARGIN = 1_000             # arcs keep this much more than the clearance (falls back to 0 if tight)
 
 
 def _xy(v: Vector2) -> tuple[int, int]:
@@ -412,6 +414,44 @@ class RubberBand:
         return result
 
     # ---------------------------------------------------------- run
+    def _dynamic(self, ch) -> list[tuple]:
+        """The other selected runs next to `ch`, as obstacles at their current position."""
+        out = []
+        for other in ch["neighbours"]:
+            cl = max(self.clearance[ch["net"]], self.clearance[other["net"]])
+            out.append((LineString(other["cur"]), other["width"] / 2 + cl + ch["width"] / 2 + EXTRA_MARGIN))
+        return out
+
+    def _elements(self, ch) -> list[tuple]:
+        """Integer ("line", a, b) / ("arc", a, mid, b) pieces for the final path of `ch`."""
+        pts = ch["cur"]
+        lines = [("line", a, b) for a, b in zip(pts, pts[1:])]
+        if not USE_ARCS:
+            return lines
+        for margin in (ARC_MARGIN, 0):
+            try:
+                el = fit_arcs([(float(x), float(y)) for x, y in pts], ch["static"] + self._dynamic(ch), margin)
+                break
+            except RubberBandError:
+                continue
+        else:
+            return lines        # arcs don't fit; the segments are known to be good
+
+        # round once, so neighbouring pieces share their end points exactly
+        r = lambda p: (int(round(p[0])), int(round(p[1])))
+        out, cur = [], pts[0]
+        for k, e in enumerate(el):
+            end = pts[-1] if k == len(el) - 1 else r(e[-1])
+            if end == cur:
+                continue
+            mid = r(e[2]) if e[0] == "arc" else None
+            if mid is not None and (mid in (cur, end) or
+                                    (end[0] - cur[0]) * (mid[1] - cur[1]) == (end[1] - cur[1]) * (mid[0] - cur[0])):
+                mid = None      # too short to be an arc after rounding
+            out.append(("arc", cur, mid, end) if mid else ("line", cur, end))
+            cur = end
+        return out
+
     def run(self):
         selected = [i for i in self.board.get_selection(
             [KiCadObjectType.KOT_PCB_TRACE, KiCadObjectType.KOT_PCB_ARC])
@@ -453,13 +493,9 @@ class RubberBand:
                     continue
                 stamp += 1
                 ch["done_at"] = stamp
-                dynamic = []
-                for other in ch["neighbours"]:
-                    cl = max(self.clearance[ch["net"]], self.clearance[other["net"]])
-                    dynamic.append((LineString(other["cur"]),
-                                    other["width"] / 2 + cl + ch["width"] / 2 + EXTRA_MARGIN))
                 try:
-                    new_pts = pull_taut([(float(x), float(y)) for x, y in ch["cur"]], ch["static"] + dynamic)
+                    new_pts = pull_taut([(float(x), float(y)) for x, y in ch["cur"]],
+                                        ch["static"] + self._dynamic(ch))
                 except RubberBandError as e:
                     ch["error"] = e
                     continue
@@ -485,10 +521,12 @@ class RubberBand:
             if path_length(ch["cur"]) >= path_length(ch["orig"]) - 1000:
                 continue
             to_remove.extend(ch["items"])
-            for a, b in zip(ch["cur"], ch["cur"][1:]):
-                nt = Track()
-                nt.start = Vector2.from_xy(*a)
-                nt.end = Vector2.from_xy(*b)
+            for el in self._elements(ch):
+                nt = ArcTrack() if el[0] == "arc" else Track()
+                nt.start = Vector2.from_xy(*el[1])
+                if el[0] == "arc":
+                    nt.mid = Vector2.from_xy(*el[2])
+                nt.end = Vector2.from_xy(*el[-1])
                 nt.width = ch["width"]
                 nt.layer = ch["layer"]
                 nt.net = ch["items"][0].net

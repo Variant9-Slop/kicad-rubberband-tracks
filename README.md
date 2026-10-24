@@ -24,8 +24,9 @@ Run DRC and refill zones afterwards.
 - Clearances come from net classes and from the board's minimum, copper-to-hole and
   copper-to-edge rules in the `.kicad_pro` file. Custom DRC rules are not read.
 - Never gets closer to anything than the rules require, or than the original track already was.
-- Output is straight segments; arcs are replaced. Curves around round obstacles become
-  many short segments.
+- Bends around vias, holes, pad corners (sharp or rounded) and track ends become arcs at
+  the required clearance plus 1 µm, joined by straight tangents. Where arcs would not fit,
+  that run keeps straight segments (`USE_ARCS = False` turns arcs off).
 
 Settings are at the top of `plugin/rubberband_action.py`.
 

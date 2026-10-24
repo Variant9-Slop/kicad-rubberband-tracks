@@ -1,9 +1,11 @@
 """Plugin glue: chains, fixed points, obstacles and rules, against a mock board."""
 
+import pytest
 from kipy.board_types import FootprintInstance
 from shapely.geometry import LineString, Point
 
-from mock_board import MockBoard, created_path, edge, pad, run, track, via
+import rubberband_action
+from mock_board import MockBoard, _set_id, created_arcs, created_path, edge, pad, run, track, via
 
 
 def around_via_board(tmp_path, selection_slice=slice(None), **kw):
@@ -102,3 +104,46 @@ def test_bend_inside_pad_mid_run_stays_fixed(tmp_path):
     b = MockBoard(tmp_path, tracks=segs, selection=segs,
                   pads=[pad(0, 0, "A"), pad(5, 3, "A"), pad(10, 0, "A")])
     assert run(b).messages == ["Nothing to change: selection is already taut."]
+
+
+def _ends_joined(items):
+    for a, b in zip(items, items[1:]):
+        assert (a.end.x, a.end.y) == (b.start.x, b.start.y)
+
+
+def test_via_wrap_becomes_one_arc(tmp_path):
+    b, _ = around_via_board(tmp_path)
+    run(b)
+    assert [type(t).__name__ for t in b.created] == ["Track", "ArcTrack", "Track"]
+    _ends_joined(b.created)
+    # 0.3 + 0.2 + 0.125 required, plus ARC_MARGIN
+    assert LineString(created_path(b)).distance(Point(5, 0)) == pytest.approx(0.626, abs=5e-6)
+
+
+def test_arcs_can_be_turned_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(rubberband_action, "USE_ARCS", False)
+    b, _ = around_via_board(tmp_path)
+    run(b)
+    assert len(b.created) > 3 and not created_arcs(b)
+    _ends_joined(b.created)
+
+
+def test_nested_nets_both_get_arcs(tmp_path):
+    a = [track((0, 0), (0, 4)), track((0, 4), (10, 4)), track((10, 4), (10, 0))]
+    bb = [track((-1, 0), (-1, 5), "B"), track((-1, 5), (11, 5), "B"), track((11, 5), (11, 0), "B")]
+    pads = [pad(0, 0, "A", 0.4), pad(10, 0, "A", 0.4), pad(-1, 0, "B", 0.4), pad(11, 0, "B", 0.4)]
+    b = MockBoard(tmp_path, tracks=a + bb, pads=pads, vias=[via(5, 1, "C")], selection=bb + a)
+    assert run(b).messages == []
+    assert created_arcs(b, "A") and created_arcs(b, "B")
+    pa, pb = LineString(created_path(b, "A")), LineString(created_path(b, "B"))
+    assert pa.distance(Point(5, 1)) >= 0.625 - 1e-6
+    assert pb.distance(pa) >= 0.45 - 1e-6
+
+
+def test_rerun_on_arcs_changes_nothing(tmp_path):
+    b, _ = around_via_board(tmp_path)
+    run(b)
+    for t in b.created:
+        _set_id(t)
+    again = MockBoard(tmp_path, tracks=b.created, vias=b.vias, pads=b.pads, selection=b.created)
+    assert run(again).messages == ["Nothing to change: selection is already taut."]

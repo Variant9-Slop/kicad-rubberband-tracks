@@ -4,12 +4,13 @@ import json
 import types
 from pathlib import Path
 
-from kipy.board_types import BoardLayer, BoardSegment, Net, Pad, Track, Via
+from kipy.board_types import ArcTrack, BoardLayer, BoardSegment, Net, Pad, Track, Via
 from kipy.geometry import PolygonWithHoles, PolyLine, PolyLineNode, Vector2
 from kipy.project_types import NetClass
 from shapely.geometry import box
 
 import rubberband_action
+from rubberband_core import sample_elements
 
 MM = 1_000_000
 F_CU = BoardLayer.BL_F_Cu
@@ -141,7 +142,16 @@ def run(board) -> rubberband_action.RubberBand:
 
 
 def created_path(board, net_name=None):
-    """Points of the created tracks (in mm), in creation order."""
-    tr = [t for t in board.created if net_name is None or t.net.name == net_name]
-    pts = [(t.start.x / MM, t.start.y / MM) for t in tr]
-    return pts + [(tr[-1].end.x / MM, tr[-1].end.y / MM)]
+    """Points of the created tracks (in mm), in creation order; arcs are followed to
+    within 1 nm."""
+    el = []
+    for t in board.created:
+        if net_name is None or t.net.name == net_name:
+            xy = lambda v: (v.x, v.y)
+            el.append(("arc", xy(t.start), xy(t.mid), xy(t.end)) if isinstance(t, ArcTrack)
+                      else ("line", xy(t.start), xy(t.end)))
+    return [(x / MM, y / MM) for x, y in sample_elements(el)]
+
+
+def created_arcs(board, net_name=None):
+    return [t for t in board.created if isinstance(t, ArcTrack) and (net_name is None or t.net.name == net_name)]

@@ -7,7 +7,8 @@ shortest path of the same topology (same side of every obstacle).
 
 - `plugin/` — exactly what KiCad loads. Flat on purpose: `plugin.json` entrypoint and icon
   paths are relative to this folder, and the entrypoint imports `rubberband_core` as a sibling.
-  - `rubberband_core.py` — pure geometry, no KiCad imports. `pull_taut(path, obstacles)`.
+  - `rubberband_core.py` — pure geometry, no KiCad imports. `pull_taut(path, obstacles)`,
+    `fit_arcs(path, obstacles, margin)`.
   - `rubberband_action.py` — KiCad side: reads the board, builds runs ("chains") and
     obstacles, runs passes, writes tracks back. Tunables at the top.
 - `pcm/` — `metadata.json` and icon for the Plugin and Content Manager package.
@@ -31,6 +32,12 @@ shortest path of the same topology (same side of every obstacle).
 3. Sleeve = triangles the original path crosses, in order, with immediate back-and-forth
    cancelled (do not remove all repeats; that drops real detours around obstacles).
 4. Funnel algorithm through the sleeve → shortest path. Final check against obstacles.
+5. On write-out only (passes work on point lists), `fit_arcs`: each corner of the taut
+   path is matched to the obstacle on the inside of its bend; consecutive corners around
+   the same point, or around obstacle points that form a polygonised circle (≥4 points,
+   ~exactly on it), become one arc at clearance + `ARC_MARGIN`, joined by exact tangents.
+   A fitted circle that then breaks (no tangent, sweep mismatch, clearance) is split back
+   into per-point arcs; if it still fails, the run is written as segments.
 
 Units are nanometres throughout (KiCad's internal unit).
 
