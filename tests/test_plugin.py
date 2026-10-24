@@ -254,3 +254,51 @@ def test_slight_bend_around_track_corner(tmp_path, deg, shape):
     assert [type(t).__name__ for t in b.created] == shape
     _ends_joined(b.created)
     assert LineString(created_path(b)).distance(LineString([(0, 0), (5, 0)])) >= 0.45 - 3e-6
+
+
+def test_notch_in_straight_run_is_removed(tmp_path):
+    # Two segments with a 179.5 degree corner: 0.1 um longer than straight, but one piece.
+    segs = [track((0, 0), (5, 0.02)), track((5, 0.02), (10, 0))]
+    b = MockBoard(tmp_path, tracks=segs, selection=segs, pads=[pad(0, 0, "A", .1), pad(10, 0, "A", .1)])
+    assert run(b).messages == []
+    assert created_path(b) == [(0, 0), (10, 0)]
+    assert len(b.removed) == 2
+
+
+def test_curve_made_of_segments_becomes_arc(tmp_path):
+    # A trace around a via whose curve is 8 segments, each touching a circle 0.5 um
+    # outside the clearance: no shorter as an arc, but 3 pieces instead of 10.
+    R, m = 0.6255, 8
+    a1, a2 = math.pi - math.acos(R / 5), math.acos(R / 5)
+    step = (a1 - a2) / m
+    corners = [(5 + R / math.cos(step / 2) * math.cos(a1 - (i + 0.5) * step),
+                R / math.cos(step / 2) * math.sin(a1 - (i + 0.5) * step)) for i in range(m)]
+    pts = [(0, 0)] + corners + [(10, 0)]
+    segs = [track(a, c) for a, c in zip(pts, pts[1:])]
+    b = MockBoard(tmp_path, tracks=segs, selection=segs, vias=[via(5, 0, "B")],
+                  pads=[pad(0, 0, "A", .1), pad(10, 0, "A", .1)])
+    assert run(b).messages == []
+    assert [type(t).__name__ for t in b.created] == ["Track", "ArcTrack", "Track"]
+    assert LineString(created_path(b)).distance(Point(5, 0)) >= 0.625 - 3e-6
+
+
+def test_clean_arc_run_is_already_taut(tmp_path):
+    b, _ = around_via_board(tmp_path)
+    run(b)
+    for t in b.created:
+        _set_id(t)
+    again = MockBoard(tmp_path, tracks=b.created, vias=b.vias, pads=b.pads, selection=b.created)
+    assert run(again).messages == ["Nothing to change: selection is already taut."]
+
+
+def test_needed_slight_corner_stays(tmp_path):
+    # A 179 degree corner at exactly the clearance from another track's corner: the
+    # run can't get shorter and an arc would be one piece more, so it stays.
+    t = math.radians(1)
+    other = [track((0, 0), (5, 0), "O"), track((5, 0), (5 + 5 * math.cos(t), 5 * math.sin(t)), "O")]
+    corner = (5 + 0.45 * math.tan(t / 2), -0.45)
+    end = (5 + 5 * math.cos(t) + 0.45 * math.sin(t), 5 * math.sin(t) - 0.45 * math.cos(t))
+    segs = [track((0, -0.45), corner), track(corner, end)]
+    b = MockBoard(tmp_path, tracks=other + segs, selection=segs,
+                  pads=[pad(0, -0.45, "A", .1), pad(end[0], end[1], "A", .1)])
+    assert run(b).messages == ["Nothing to change: selection is already taut."]

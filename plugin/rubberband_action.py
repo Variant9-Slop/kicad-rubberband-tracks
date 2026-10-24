@@ -550,8 +550,13 @@ class RubberBand:
                 ipts = [(int(round(x)), int(round(y))) for x, y in new_pts]
                 ipts[0], ipts[-1] = ch["orig"][0], ch["orig"][-1]
                 ipts = [p for i, p in enumerate(ipts) if i == 0 or p != ipts[i - 1]]
-                if path_length(ipts) < path_length(ch["cur"]) - 1000:   # > 1 um shorter
+                # Take the taut path even when it is barely shorter (a 179 degree notch, a
+                # curve made of segments): its corners are what fit_arcs needs. Only a real
+                # gain (> 1 um) counts as a change that the neighbours have to follow.
+                gain = path_length(ch["cur"]) - path_length(ipts)
+                if gain >= -2:      # not longer, give or take rounding
                     ch["cur"] = ipts
+                if gain > 1000:
                     stamp += 1
                     ch["changed_at"] = stamp
                     improved = True
@@ -565,10 +570,12 @@ class RubberBand:
                 x, y = e.where if e.where else ch["orig"][0]
                 self.messages.append(f"Net '{ch['net'] or '<no net>'}' on {self.board.get_layer_name(ch['layer'])} "
                                      f"near ({x / 1e6:.3f}, {y / 1e6:.3f}) mm: {e}")
-            if path_length(ch["cur"]) >= path_length(ch["orig"]) - 1000:
+            # replace the run if it gets shorter, or comes out in fewer pieces
+            elements = self._elements(ch)
+            if path_length(ch["cur"]) >= path_length(ch["orig"]) - 1000 and len(elements) >= len(ch["items"]):
                 continue
             to_remove.extend(ch["items"])
-            for el in self._elements(ch):
+            for el in elements:
                 nt = ArcTrack() if el[0] == "arc" else Track()
                 nt.start = Vector2.from_xy(*el[1])
                 if el[0] == "arc":

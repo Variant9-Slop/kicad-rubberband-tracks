@@ -659,12 +659,13 @@ def _arc_elements(path, inner, turns, groups, min_sag) -> list[tuple]:
         elements.append(("line", pt(q_out), end))
     if len(nodes) == 2:
         elements = [("line", path[0], path[-1])]
-    return _tidy(elements)
+    return _tidy(elements, min_sag)
 
 
-def _tidy(elements, tol: float = 1.0, short: float = 1000.0) -> list[tuple]:
-    """Merge straight pieces that are in line, and fold pieces shorter than `short` into
-    the one before (left over from corners that only needed a sliver of arc)."""
+def _tidy(elements, tol: float, short: float = 1000.0) -> list[tuple]:
+    """Merge straight pieces whose joint is less than `tol` off the line through their
+    ends (a kink within rounding), and fold pieces shorter than `short` into the one
+    before (left over from corners that only needed a sliver of arc)."""
     out: list[list] = []
     for e in elements:
         e = list(e)
