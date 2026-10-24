@@ -49,6 +49,7 @@ Units are nanometres throughout (KiCad's internal unit).
 
 ## Known issues
 
-- "internal: result is longer than the original" still reported on some multi-net runs;
-  not reproduced in tests yet. `_nudge_out` was added as a candidate fix, unverified.
+- "internal: result is longer than the original": one cause found and fixed (an endpoint
+  lying exactly on a triangle edge, see `test_start_on_triangle_edge`). It was also seen on
+  multi-net runs that may have another cause; `_nudge_out` was added for those, unverified.
 - Custom DRC rules and copper zones are not considered.

@@ -172,6 +172,16 @@ def _sleeve(path: Sequence[Pt], tri_geoms: list[Polygon], adj) -> list[int]:
             out.pop()
         elif not out or out[-1] != t:
             out.append(t)
+
+    # An endpoint can lie exactly on a triangle edge (a via in line with the tips of two
+    # grown obstacles), so the triangle picked for it may be one the path only touches.
+    # The portal into the next triangle would then pass through the funnel apex, which
+    # opens the funnel to 180° and makes it wrap a neighbouring obstacle. Start and end
+    # in the triangles the path actually runs through.
+    while len(out) >= 2 and tri_geoms[out[1]].distance(start) < 1.0:
+        out.pop(0)
+    while len(out) >= 2 and tri_geoms[out[-2]].distance(end) < 1.0:
+        out.pop()
     return out
 
 

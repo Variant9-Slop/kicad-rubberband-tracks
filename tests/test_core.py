@@ -112,3 +112,13 @@ def test_random_obstacle_fields():
         assert r[0] == pts[0] and r[-1] == pts[-1]
         assert path_length(r) <= path_length(pts) + 1
         assert min_margin(r, obs) > -500
+
+
+def test_start_on_triangle_edge():
+    # Start via in line with two neighbouring vias (AD4 on B.Cu, GbaCartBreakout): the
+    # triangulation has an edge between their grown tips that runs through the start
+    # point. The sleeve must not begin in the triangle on the far side of that edge.
+    obs = [(Point(-1.5 * MM, 0), 0.5 * MM), (Point(1.553 * MM, 0), 0.5 * MM)]
+    path = mm([(0, 0), (-4.025, 4.025), (-8.205, 9.838), (-8.205, 10.155), (-8.9, 10.85)])
+    r = pull_taut(path, obs)
+    assert r == [path[0], path[-1]]
