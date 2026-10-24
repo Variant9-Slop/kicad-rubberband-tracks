@@ -50,12 +50,13 @@ def _xy(v: Vector2) -> tuple[int, int]:
     return (int(v.x), int(v.y))
 
 
-def _arc_points(start: Vector2, mid: Vector2, end: Vector2) -> list[tuple[float, float]]:
+def _curve_circle(start: Vector2, mid: Vector2, end: Vector2):
+    """(cx, cy, r, start angle, signed sweep) of the arc through start, mid and end, or
+    None if it is straight."""
     c = arc_center(start, mid, end)
     if c is None:
-        return [_xy(start), _xy(end)]
+        return None
     cx, cy = c.x, c.y
-    r = math.hypot(start.x - cx, start.y - cy)
     a0 = math.atan2(start.y - cy, start.x - cx)
     am = math.atan2(mid.y - cy, mid.x - cx)
     a1 = math.atan2(end.y - cy, end.x - cx)
@@ -65,20 +66,56 @@ def _arc_points(start: Vector2, mid: Vector2, end: Vector2) -> list[tuple[float,
     sweep = norm(a1 - a0)
     if norm(am - a0) > sweep:          # mid not on the CCW sweep -> go the other way
         sweep -= 2 * math.pi
+    return cx, cy, math.hypot(start.x - cx, start.y - cy), a0, sweep
+
+
+def _shape_circle(s):
+    if isinstance(s, BoardArc):
+        return _curve_circle(s.start, s.mid, s.end)
+    if isinstance(s, BoardCircle):
+        return (s.center.x, s.center.y, s.radius(), 0.0, 2 * math.pi)
+    return None
+
+
+def _arc_points(start: Vector2, mid: Vector2, end: Vector2, side=None) -> list[tuple[float, float]]:
+    """Arc as a polyline within ARC_MAX_ERROR, chords cutting inside the arc. With `side`
+    "outer" it runs along tangents just outside the arc instead, and with "inner" it is
+    chords whose corners sit under the outer polyline's corners (see _arc_band)."""
+    circle = _curve_circle(start, mid, end)
+    if circle is None:
+        return [_xy(start), _xy(end)]
+    cx, cy, r, a0, sweep = circle
     step = 2 * math.acos(max(-1.0, 1 - ARC_MAX_ERROR / r)) if r > ARC_MAX_ERROR else math.pi / 8
     n = max(2, int(math.ceil(abs(sweep) / step)))
-    pts = [_xy(start)]
-    for i in range(1, n):
-        a = a0 + sweep * i / n
-        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    pts.append(_xy(end))
-    return pts
+    if side is None:
+        angles, rr = [a0 + sweep * i / n for i in range(1, n)], r
+    else:   # outer: corners where the tangents at a0 + sweep * i / n meet
+        angles = [a0 + sweep * (i + 0.5) / n for i in range(n)]
+        rr = r / math.cos(sweep / n / 2) if side == "outer" else r
+    return [_xy(start)] + [(cx + rr * math.cos(a), cy + rr * math.sin(a)) for a in angles] + [_xy(end)]
+
+
+def _arc_band(start: Vector2, mid: Vector2, end: Vector2):
+    """Arc as an obstacle: the thin band between chords inside it and tangents outside
+    it, so keeping clear of the band keeps clear of the true arc from either side."""
+    outer = _arc_points(start, mid, end, "outer")
+    if len(outer) < 3:
+        return LineString(outer)
+    band = Polygon(outer + _arc_points(start, mid, end, "inner")[-2:0:-1])
+    return band if band.is_valid else LineString(outer)
 
 
 def _track_points(t) -> list:
     if isinstance(t, ArcTrack):
         return _arc_points(t.start, t.mid, t.end)
     return [_xy(t.start), _xy(t.end)]
+
+
+def _track_geom(t):
+    """A track as an obstacle."""
+    if isinstance(t, ArcTrack):
+        return _arc_band(t.start, t.mid, t.end)
+    return LineString(_track_points(t))
 
 
 def _poly_from_proto(pwh) -> Polygon | None:
@@ -104,9 +141,13 @@ def _shape_outline(s):
     if isinstance(s, BoardSegment):
         return LineString([_xy(s.start), _xy(s.end)])
     if isinstance(s, BoardArc):
-        return LineString(_arc_points(s.start, s.mid, s.end))
+        return _arc_band(s.start, s.mid, s.end)
     if isinstance(s, BoardCircle):
-        return Point(_xy(s.center)).buffer(s.radius(), quad_segs=QUAD_SEGS).exterior
+        # band between the inscribed and circumscribed polygons (see _arc_band)
+        (cx, cy), n, r = _xy(s.center), 4 * QUAD_SEGS, s.radius()
+        ring = lambda rr, off: [(cx + rr * math.cos(2 * math.pi * (i + off) / n),
+                                 cy + rr * math.sin(2 * math.pi * (i + off) / n)) for i in range(n)]
+        return Polygon(ring(r / math.cos(math.pi / n), 0.5), [ring(r, 0)])
     if isinstance(s, BoardRectangle):
         (x0, y0), (x1, y1) = _xy(s.top_left), _xy(s.bottom_right)
         return Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)]).exterior
@@ -126,14 +167,15 @@ def _shape_outline(s):
 
 
 class Obstacle:
-    __slots__ = ("geom", "net", "radius", "kind", "clearance_override")
+    __slots__ = ("geom", "net", "radius", "kind", "clearance_override", "circle")
 
-    def __init__(self, geom, net, radius=0.0, kind="copper", clearance_override=None):
+    def __init__(self, geom, net, radius=0.0, kind="copper", clearance_override=None, circle=None):
         self.geom = geom            # raw (unbuffered) geometry
         self.net = net              # net name, "" = no net
         self.radius = radius        # copper half-size already implied by the geometry
         self.kind = kind            # copper | edge | keepout
         self.clearance_override = clearance_override
+        self.circle = circle        # (cx, cy, r) of the arc or circle geom approximates
 
 
 class RubberBand:
@@ -177,15 +219,15 @@ class RubberBand:
         self.clearance.default_factory = lambda: max(default, board_min)
 
         # Edge.Cuts drawn on the board and inside footprints (absolute coordinates)
-        self.edges = [g for g in (_shape_outline(sh) for sh in self.shapes
-                                  if sh.layer == BoardLayer.BL_Edge_Cuts) if g is not None]
+        self.edges = [(g, _shape_circle(sh)) for sh in self.shapes
+                      if sh.layer == BoardLayer.BL_Edge_Cuts and (g := _shape_outline(sh)) is not None]
         try:
             for fp in b.get_footprints():
                 for sh in fp.definition.shapes:
                     if sh.layer == BoardLayer.BL_Edge_Cuts:
                         g = _shape_outline(sh)
                         if g is not None:
-                            self.edges.append(g)
+                            self.edges.append((g, _shape_circle(sh)))
         except Exception as e:
             self.messages.append(f"Could not read footprint Edge.Cuts: {e}")
 
@@ -258,7 +300,8 @@ class RubberBand:
         for t in self.tracks:
             if t.layer != layer or t.id.value in moving:
                 continue
-            obs.append(Obstacle(LineString(_track_points(t)), t.net.name, t.width / 2))
+            circle = _curve_circle(t.start, t.mid, t.end) if isinstance(t, ArcTrack) else None
+            obs.append(Obstacle(_track_geom(t), t.net.name, t.width / 2, circle=circle))
         for v in self._vias_on(layer):
             obs.append(Obstacle(Point(_xy(v.position)), v.net.name, v.diameter / 2))
         # drill holes: copper-to-hole clearance, on every layer the hole passes through
@@ -293,14 +336,14 @@ class RubberBand:
                     poly = _poly_from_proto(pwh)
                     if poly is not None:
                         obs.append(Obstacle(poly, net))
-        for g in self.edges:
-            obs.append(Obstacle(g, "", kind="edge"))
+        for g, circle in self.edges:
+            obs.append(Obstacle(g, "", kind="edge", circle=circle))
         for s in self.shapes:
             if s.layer == layer:
                 net = s.net.name if s.net else ""
                 g = _shape_outline(s)
                 if g is not None:
-                    obs.append(Obstacle(g, net, s.attributes.stroke.width / 2))
+                    obs.append(Obstacle(g, net, s.attributes.stroke.width / 2, circle=_shape_circle(s)))
         return obs
 
     def required(self, obs: list[Obstacle], own_net: str, half_width: float) -> list[tuple]:
@@ -428,9 +471,12 @@ class RubberBand:
         lines = [("line", a, b) for a, b in zip(pts, pts[1:])]
         if not USE_ARCS:
             return lines
-        for margin in (ARC_MARGIN, 0):
+        # with a margin; at the required distance; inside the segments (squeezed runs)
+        for margin, inside in ((ARC_MARGIN, False), (0, False), (0, True)):
             try:
-                el = fit_arcs([(float(x), float(y)) for x, y in pts], ch["static"] + self._dynamic(ch), margin)
+                dynamic = self._dynamic(ch)
+                el = fit_arcs([(float(x), float(y)) for x, y in pts], ch["static"] + dynamic, margin,
+                              inside=inside, circles=ch["circles"] + [None] * len(dynamic))
                 break
             except RubberBandError:
                 continue
@@ -445,9 +491,9 @@ class RubberBand:
             if end == cur:
                 continue
             mid = r(e[2]) if e[0] == "arc" else None
-            if mid is not None and (mid in (cur, end) or
-                                    (end[0] - cur[0]) * (mid[1] - cur[1]) == (end[1] - cur[1]) * (mid[0] - cur[0])):
-                mid = None      # too short to be an arc after rounding
+            if mid is not None and abs((end[0] - cur[0]) * (mid[1] - cur[1]) - (end[1] - cur[1]) * (mid[0] - cur[0])) \
+                    < 1.5 * math.dist(cur, end):
+                mid = None      # mid < 1.5 nm off the chord: rounding would bend it any which way
             out.append(("arc", cur, mid, end) if mid else ("line", cur, end))
             cur = end
         return out
@@ -469,7 +515,8 @@ class RubberBand:
             orig_line = LineString(pts)
             static = [(g, d, orig_line.distance(g)) for g, d in self.required(raw, net, width / 2)]
             chains.append(dict(layer=layer, net=net, width=width, items=items, orig=list(pts),
-                               cur=list(pts), static=static, region=region, error=None,
+                               cur=list(pts), static=static, circles=[o.circle for o in raw],
+                               region=region, error=None,
                                changed_at=0, done_at=-1, neighbours=[]))
 
         # neighbours = other-net runs on the same layer that can affect this one

@@ -33,11 +33,23 @@ shortest path of the same topology (same side of every obstacle).
    cancelled (do not remove all repeats; that drops real detours around obstacles).
 4. Funnel algorithm through the sleeve → shortest path. Final check against obstacles.
 5. On write-out only (passes work on point lists), `fit_arcs`: each corner of the taut
-   path is matched to the obstacle on the inside of its bend; consecutive corners around
-   the same point, or around obstacle points that form a polygonised circle (≥4 points,
-   ~exactly on it), become one arc at clearance + `ARC_MARGIN`, joined by exact tangents.
+   path is matched to the obstacle on the inside of its bend (preferring the previous
+   corner's); consecutive corners around the same point, or around obstacle points that
+   form a polygonised circle (≥4 points, ~exactly on it; later points may join within
+   `ARC_JOIN_TOL`), become one arc at clearance + `ARC_MARGIN`, joined by exact tangents.
    A fitted circle that then breaks (no tangent, sweep mismatch, clearance) is split back
-   into per-point arcs; if it still fails, the run is written as segments.
+   into per-point arcs. The plugin tries margin, then 0, then arcs kept inside the
+   segments (runs squeezed between selected neighbours); else the run is written as segments.
+   Arcs under `ARC_MIN_SAGITTA` (3 nm) off their chord would be warped by rounding to nm;
+   they become one corner where the tangents meet (bends of under ~0.5°).
+
+Curves on the board (arc tracks, graphic arcs, circles) are obstacles as a thin band
+between chords inside and tangents outside the true curve (`_arc_band`), so clearance to
+the band is never more than to the curve, from either side. Their true circle and extent
+go to `fit_arcs` as `circles`: corners around them use that centre and radius (never
+re-fitted, never split), and the final check measures the true curve, so each ring of
+tracks around the last doesn't creep outwards and hit the next one at minimum pitch.
+Selected runs' own arcs are read as plain chords (`_track_points`).
 
 Units are nanometres throughout (KiCad's internal unit).
 
@@ -60,3 +72,6 @@ Units are nanometres throughout (KiCad's internal unit).
   lying exactly on a triangle edge, see `test_start_on_triangle_edge`). It was also seen on
   multi-net runs that may have another cause; `_nudge_out` was added for those, unverified.
 - Custom DRC rules and copper zones are not considered.
+- Where the original sits at exactly the required clearance, growth is capped at that
+  distance and the polygon sides fall ~0.03 % inside it, so results can be ~0.15 µm under
+  the rule (below KiCad's default 0.5 µm DRC epsilon).
