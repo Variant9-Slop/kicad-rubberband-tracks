@@ -4,7 +4,7 @@ import math
 
 import pytest
 from kipy.board_types import FootprintInstance
-from kipy.geometry import arc_center
+from kipy.geometry import Vector2, arc_center
 from shapely.geometry import LineString, Point
 
 import rubberband_action
@@ -119,8 +119,9 @@ def test_via_wrap_becomes_one_arc(tmp_path):
     run(b)
     assert [type(t).__name__ for t in b.created] == ["Track", "ArcTrack", "Track"]
     _ends_joined(b.created)
-    # 0.3 + 0.2 + 0.125 required, plus ARC_MARGIN
-    assert LineString(created_path(b)).distance(Point(5, 0)) == pytest.approx(0.626, abs=5e-6)
+    # 0.3 + 0.2 + 0.125 required, exactly (+2 nm for rounding)
+    assert LineString(created_path(b)).distance(Point(5, 0)) == pytest.approx(0.625, abs=3e-6)
+    assert LineString(created_path(b)).distance(Point(5, 0)) >= 0.625
 
 
 def test_arcs_can_be_turned_off(tmp_path, monkeypatch):
@@ -225,9 +226,9 @@ def test_tracks_around_via_rounded_one_by_one(tmp_path):
         assert sum(math.hypot(c.x - 5 * MM, c.y) < 1000 for c in centres) == 1
         assert len(centres) == (1 if n == 0 else 3)
         path = LineString(created_path(b))
-        for t in later:
+        for t in later:     # within CHECK_TOL (5 nm) of the next original at minimum pitch
             assert path.distance(LineString([(t.start.x / MM, t.start.y / MM), (t.end.x / MM, t.end.y / MM)])) \
-                >= 0.45 - 3e-6
+                >= 0.45 - 5e-6
         if n:
             # the originals sit at exactly the clearance: 2 nm (pull_taut's eps) + rounding
             assert path.distance(prev) >= 0.45 - 3e-6
@@ -309,7 +310,7 @@ def test_run_without_clean_result_is_left_alone(tmp_path, monkeypatch):
     # never written as the intermediate segments.
     def fail(*a, **k):
         raise rubberband_action.RubberBandError("test", (5e6, 1e6))
-    monkeypatch.setattr(rubberband_action, "fit_arcs", fail)
+    monkeypatch.setattr(rubberband_action, "exact_path", fail)
     b, _ = around_via_board(tmp_path)
     msgs = run(b).messages
     assert b.created == [] and b.removed == []
@@ -318,14 +319,88 @@ def test_run_without_clean_result_is_left_alone(tmp_path, monkeypatch):
 
 def test_sliver_result_is_left_alone(tmp_path, monkeypatch):
     # A result with a straight piece under MIN_SEGMENT is a sliver: not written.
-    real = rubberband_action.fit_arcs
+    real = rubberband_action.exact_path
 
     def with_sliver(*a, **k):
         el = real(*a, **k)
         (_, p, q), rest = el[0], el[1:]
         m = (p[0] + (q[0] - p[0]) * 0.999, p[1] + (q[1] - p[1]) * 0.999)
         return [("line", p, m), ("line", m, q)] + rest
-    monkeypatch.setattr(rubberband_action, "fit_arcs", with_sliver)
+    monkeypatch.setattr(rubberband_action, "exact_path", with_sliver)
     b, _ = around_via_board(tmp_path)
     msgs = run(b).messages
     assert b.created == [] and "straight piece" in msgs[0]
+
+
+@pytest.mark.parametrize("drill", [0.3, 3.2])
+def test_hole_clearance_exact_when_original_at_clearance(tmp_path, drill):
+    # A track already at exactly the hole clearance around a big hole (no copper on the
+    # layer): the result keeps it exactly (it was 0.6 um inside for a 3.2 mm hole).
+    d, n = drill / 2 + 0.25 + 0.125, 12
+    corners = [(5 + d / math.cos(math.pi / (2 * n)) * math.cos(math.pi * (i + 0.5) / n),
+                d / math.cos(math.pi / (2 * n)) * math.sin(math.pi * (i + 0.5) / n)) for i in range(n)]
+    pts = [(5 + d, -3), (5 + d, 0)] + corners + [(5 - d, 0), (5 - d, -3)]
+    segs = [track(a, c) for a, c in zip(pts, pts[1:])]
+    b = MockBoard(tmp_path, tracks=segs, selection=segs, vias=[via(5, 0, "H", diameter=0.0, drill=drill)],
+                  pads=[pad(*pts[0], "A", .1), pad(*pts[-1], "A", .1)])
+    b.check_padstack_presence_on_layers = lambda items, layer: {i: {layer: False} for i in items}
+    assert run(b).messages == []
+    # straight ends, the half turn round the hole as arcs (KiCad arcs: under a half turn each)
+    kinds = [type(t).__name__ for t in b.created]
+    assert kinds[0] == kinds[-1] == "Track" and set(kinds[1:-1]) == {"ArcTrack"}
+    for t in created_arcs(b):
+        c = arc_center(t.start, t.mid, t.end)
+        assert math.hypot(c.x - 5 * MM, c.y) < 2
+    assert LineString(created_path(b)).distance(Point(5, 0)) >= d
+
+
+def test_track_a_hair_too_close_is_put_right(tmp_path):
+    # A run 0.7 um inside the via clearance (as earlier versions of this plugin left them):
+    # re-running pushes it out to the rule, though that is not shorter.
+    r = 0.625 - 0.0007
+    a1, a2 = math.pi - math.acos(r / 5), math.acos(r / 5)
+    on = lambda a: (5 + r * math.cos(a), r * math.sin(a))
+    b = MockBoard(tmp_path, vias=[via(5, 0, "B")], pads=[pad(0, 0, "A", .1), pad(10, 0, "A", .1)])
+    first, arc, last = track((0, 0), on(a1)), track(on(a1), on(a2)), track(on(a2), (10, 0))
+    arc = rubberband_action.ArcTrack()
+    _set_id(arc)
+    arc.start, arc.end = first.end, last.start
+    arc.mid = Vector2.from_xy(5 * MM, int(round(r * MM)))
+    arc.width, arc.layer, arc.net = first.width, first.layer, first.net
+    b.tracks = b.selection = [first, arc, last]
+    assert run(b).messages == []
+    assert LineString(created_path(b)).distance(Point(5, 0)) >= 0.625
+
+
+def _roundrect_pad(x, y, sx, sy, ratio, deg, offset=(0, 0), poly_deg=None):
+    """Rounded-rectangle pad at (x, y) mm, turned by deg, with KiCad's polygon of it (a
+    polygon turned by poly_deg, default deg)."""
+    from shapely import affinity
+    from shapely.geometry import box as sbox
+    p = pad(x, y, "P", sx, sy)
+    cl = p.proto.pad_stack.copper_layers[0]
+    cl.shape = rubberband_action.board_types_pb2.PSS_ROUNDRECT
+    cl.corner_rounding_ratio = ratio
+    cl.offset.x_nm, cl.offset.y_nm = int(offset[0] * MM), int(offset[1] * MM)
+    p.proto.pad_stack.angle.value_degrees = deg
+    rad = ratio * min(sx, sy) * MM
+    shape = sbox(-sx / 2 * MM + rad, -sy / 2 * MM + rad, sx / 2 * MM - rad, sy / 2 * MM - rad).buffer(rad, quad_segs=32)
+    shape = affinity.translate(shape, offset[0] * MM, offset[1] * MM)
+    shape = affinity.rotate(shape, deg if poly_deg is None else poly_deg, origin=(0, 0))
+    shape = affinity.translate(shape, x * MM, y * MM)
+    return p, shape
+
+
+@pytest.mark.parametrize("deg", [0, 30, -75])
+def test_pad_shape_is_exact_roundrect(deg):
+    p, poly = _roundrect_pad(3, 4, 1.2, 0.6, 0.25, deg, offset=(0.1, 0))
+    geom, rho = rubberband_action._pad_shape(p, rubberband_action.BoardLayer.BL_F_Cu, poly)
+    assert rho == pytest.approx(0.15 * MM)
+    assert geom.geom_type == "Polygon" and len(geom.exterior.coords) == 5      # corner centres
+    assert geom.buffer(rho, quad_segs=64).hausdorff_distance(poly) < 2000
+
+
+def test_pad_shape_falls_back_when_it_disagrees_with_kicad():
+    p, poly = _roundrect_pad(3, 4, 1.2, 0.6, 0.25, 30, poly_deg=60)
+    geom, rho = rubberband_action._pad_shape(p, rubberband_action.BoardLayer.BL_F_Cu, poly)
+    assert geom is poly and rho == rubberband_action.PAD_POLY_ERROR

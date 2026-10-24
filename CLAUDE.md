@@ -7,8 +7,8 @@ shortest path of the same topology (same side of every obstacle).
 
 - `plugin/` — exactly what KiCad loads. Flat on purpose: `plugin.json` entrypoint and icon
   paths are relative to this folder, and the entrypoint imports `rubberband_core` as a sibling.
-  - `rubberband_core.py` — pure geometry, no KiCad imports. `pull_taut(path, obstacles)`,
-    `fit_arcs(path, obstacles, margin)`.
+  - `rubberband_core.py` — pure geometry, no KiCad imports. `pull_taut(path, obstacles)`
+    finds the topology, `exact_path(taut, obstacles)` the exact lines and arcs.
   - `rubberband_action.py` — KiCad side: reads the board, builds runs ("chains") and
     obstacles, runs passes, writes tracks back. Tunables at the top.
 - `pcm/` — `metadata.json` and icon for the Plugin and Content Manager package.
@@ -23,35 +23,42 @@ shortest path of the same topology (same side of every obstacle).
 
 ## Algorithm (core)
 
-1. Each obstacle is `(geometry, required_centreline_distance[, reference_distance])`.
-   It is grown by `min(required, reference - eps)`, reference defaulting to the path's
-   current distance. So the result is never tighter than the rules nor than the original.
-2. Free space = convex hull of the path (+1 mm) minus grown obstacles; constrained
-   Delaunay triangulation (no Steiner points, so loops in the triangle graph only go
-   around obstacles).
-3. Sleeve = triangles the original path crosses, in order, with immediate back-and-forth
-   cancelled (do not remove all repeats; that drops real detours around obstacles).
-4. Funnel algorithm through the sleeve → shortest path. Final check against obstacles.
-5. On write-out only (passes work on point lists), `fit_arcs`: each corner of the taut
-   path is matched to the obstacle on the inside of its bend (preferring the previous
-   corner's); consecutive corners around the same point, or around obstacle points that
-   form a polygonised circle (≥4 points, ~exactly on it; later points may join within
-   `ARC_JOIN_TOL`), become one arc at clearance + `ARC_MARGIN`, joined by exact tangents.
-   A fitted circle that then breaks (no tangent, sweep mismatch, clearance) is split back
-   into per-point arcs. The plugin tries margin, then 0, then arcs kept inside the
-   segments (runs squeezed between selected neighbours). If none fits, or the result has a
-   straight piece under `MIN_SEGMENT`, the run is left as it was and reported: never write
-   the intermediate polyline (it is as fine as the polygons, i.e. slivers).
-   Arcs under `ARC_MIN_SAGITTA` (3 nm) off their chord would be warped by rounding to nm;
-   they become one corner where the tangents meet (bends of under ~0.5°).
+A shortest path that keeps clear of obstacles is straight lines plus arcs round obstacle
+features (via/hole centre, pad or polygon corner, rounded-corner centre, track end, arc
+centre) at the required distance. Polygons are only used to find *which* features the
+path wraps; the output is computed exactly. Never fit or guess curves from points: that
+approach (v0.6.0–0.6.3 `fit_arcs`) produced slivers and sub-µm violations with every fix.
 
-Curves on the board (arc tracks, graphic arcs, circles) are obstacles as a thin band
-between chords inside and tangents outside the true curve (`_arc_band`), so clearance to
-the band is never more than to the curve, from either side. Their true circle and extent
-go to `fit_arcs` as `circles`: corners around them use that centre and radius (never
-re-fitted, never split), and the final check measures the true curve, so each ring of
-tracks around the last doesn't creep outwards and hit the next one at minimum pitch.
-Selected runs' own arcs are read as plain chords (`_track_points`).
+Obstacles are `Ob(geom, d, ref=None, arc=None)`: `geom` must stay `d` from the path;
+`ref` = the original track's distance (default: the current path's); `arc` = true circle
+and extent when `geom` is a band standing in for an arc.
+
+1. `pull_taut`: grow each obstacle by `min(d, ref - eps)` (polygon scaled up by
+   `_BUF_SCALE`), free space = convex hull of the path (+1 mm) minus grown obstacles;
+   constrained Delaunay triangulation (no Steiner points, so loops in the triangle graph
+   only go around obstacles). Sleeve = triangles the original path crosses, in order,
+   immediate back-and-forth cancelled (do not remove all repeats; that drops real detours
+   around obstacles). Funnel through the sleeve → taut polyline.
+2. `exact_path`: each polyline corner → the obstacle whose grown outline it lies on,
+   inside the bend → that obstacle's feature (nearest skeleton vertex, or the arc's centre
+   if beside the arc). Consecutive corners on one feature = one wrap, radius = feature
+   radius + `keep` (+ `ROUNDING` spare, dropped if that doesn't fit). Exact tangents
+   between wraps (`_tangent`; nearly touching circles switch where they touch or cross,
+   never via a µm sliver). Check against the true shapes (arcs sampled to 0.1 nm,
+   `CHECK_TOL` 5 nm): add the feature a piece cuts into, drop a wrap whose sweep went
+   negative, repeat. Arcs under `ARC_MIN_SAGITTA` (3 nm) off their chord become a corner.
+3. `keep` = `d` if the original was within `SNAP_TOL` (2 µm) of it, else the original's
+   distance (never tighter than the original); capped by the fixed ends' distance. So
+   re-running on tracks a hair too close (older versions) puts them right.
+
+Plugin: pads are exact shapes from the pad stack (circle/oval/rect/roundrect: skeleton +
+corner radius), used only if they match KiCad's polygon (Hausdorff ≤ 2·`PAD_POLY_ERROR`),
+else that polygon. Arcs on the board are bands (`arc_band`: chords inside, tangents
+outside) plus their true circle. Neighbouring selected runs are passed to each other as
+their exact elements. A run is written if shorter, in fewer pieces, or fixing a
+violation; if it can't be made clean (incl. a straight piece under `MIN_SEGMENT`) it is
+left alone and reported. `USE_ARCS = False` writes the taut polyline instead (coarse:
+can be ~0.07 % of the distance inside a capped obstacle).
 
 Units are nanometres throughout (KiCad's internal unit).
 
@@ -74,6 +81,6 @@ Units are nanometres throughout (KiCad's internal unit).
   lying exactly on a triangle edge, see `test_start_on_triangle_edge`). It was also seen on
   multi-net runs that may have another cause; `_nudge_out` was added for those, unverified.
 - Custom DRC rules and copper zones are not considered.
-- Where the original sits at exactly the required clearance, growth is capped at that
-  distance and the polygon sides fall ~0.03 % inside it, so results can be ~0.15 µm under
-  the rule (below KiCad's default 0.5 µm DRC epsilon).
+- Custom pads (and trapezoid/chamfered) use KiCad's polygon: a path round their curved
+  parts wraps each polygon corner, which can give straight pieces under `MIN_SEGMENT`
+  (the run is then left alone and reported).

@@ -18,12 +18,11 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 import numpy as np
 import shapely
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon
-from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
 Pt = tuple[float, float]
@@ -334,23 +333,62 @@ def pull_taut(path: Sequence[Pt], obstacles: Iterable[tuple], eps: float = 2.0,
     return result
 
 
-# ---------------------------------------------------------------- arcs
+# ---------------------------------------------------------------- exact path
+#
+# A shortest path that keeps clear of obstacles is made of straight lines and arcs round
+# obstacle features (a via or hole centre, a pad or polygon corner, a track end, an arc's
+# centre) at the required distance. pull_taut finds which features the path wraps, on
+# polygons; exact_path then builds the true lines and arcs round those features and checks
+# them against the true shapes. Nothing is fitted or guessed.
 
-ARC_FIT_TOL = 10_000.0      # how far corner points may sit off one fitted circle (polygonised pads)
-ARC_MIN_SAGITTA = 3.0       # flatter arcs (nm off their chord) become a corner: rounding would warp them
-ARC_JOIN_TOL = 2_000.0      # how far further points may sit off a circle already fitted to others
+ARC_MIN_SAGITTA = 3.0   # flatter arcs (nm off their chord) become a corner: rounding would warp them
+SNAP_TOL = 2_000.0      # an original this close to the required distance counts as meant to be at it
+ROUNDING = 2.0          # added to exact distances: the caller rounds to whole nm
+CHECK_ERR = 0.1         # curves are checked as chords this close to them
+CHECK_TOL = 5.0         # allowed shortfall (nm): other tracks are on whole nm, their pieces
+                        # don't quite meet; KiCad's DRC ignores far more (its epsilon, 0.5 um)
 
 
-def _fit_circle(pts) -> tuple[np.ndarray, float]:
-    """Least-squares circle through `pts`: (centre, max distance of a point off the circle)."""
-    a = np.asarray(pts, dtype=float)
-    m = a.mean(axis=0)
-    x = a - m
-    A = np.column_stack([2 * x[:, 0], 2 * x[:, 1], np.ones(len(x))])
-    sol = np.linalg.lstsq(A, (x ** 2).sum(axis=1), rcond=None)[0]
-    c = sol[:2]
-    r = math.sqrt(max(sol[2] + c @ c, 0.0))
-    return c + m, float(np.abs(np.hypot(*(x - c).T) - r).max())
+class Ob(NamedTuple):
+    """An obstacle: `geom` must stay `d` away from the path.
+
+    ref: the original track's distance to it (default: the path's current distance).
+    Where that is closer than `d` (by more than SNAP_TOL) the path may come as close.
+    arc: (cx, cy, r, start angle, signed sweep) when geom stands in for a circular arc
+    (see arc_band); the path then wraps the arc's centre and is checked against the arc.
+    """
+    geom: object
+    d: float
+    ref: float | None = None
+    arc: tuple | None = None
+
+
+def arc_points(arc, max_err: float, side: str | None = None) -> list[Pt]:
+    """Points of `arc` = (cx, cy, r, a0, sweep): chords within max_err inside it; with side
+    "outer", a polyline along tangents just outside it; "inner", chords whose corners sit
+    under the outer one's corners."""
+    cx, cy, r, a0, sweep = arc
+    step = 2 * math.acos(max(-1.0, 1 - max_err / r)) if r > max_err else math.pi / 8
+    n = max(2, int(math.ceil(abs(sweep) / step)))
+    if side is None:
+        angles, rr = [a0 + sweep * i / n for i in range(n + 1)], r
+    else:   # outer: corners where the tangents at a0 + sweep * i / n meet
+        angles = [a0 + sweep * (i + 0.5) / n for i in range(n)]
+        rr = r / math.cos(sweep / n / 2) if side == "outer" else r
+    pts = [(cx + rr * math.cos(a), cy + rr * math.sin(a)) for a in angles]
+    if side is not None:
+        ends = [(cx + r * math.cos(a0), cy + r * math.sin(a0)),
+                (cx + r * math.cos(a0 + sweep), cy + r * math.sin(a0 + sweep))]
+        pts = [ends[0]] + pts + [ends[1]]
+    return pts
+
+
+def arc_band(arc, max_err: float):
+    """An arc as a polygon: the thin band between chords inside it and tangents outside
+    it, so keeping clear of the band keeps clear of the arc from either side."""
+    outer = arc_points(arc, max_err, "outer")
+    band = Polygon(outer + arc_points(arc, max_err, "inner")[-2:0:-1])
+    return band if band.is_valid else LineString(outer)
 
 
 def _circumcentre(a: Pt, b: Pt, c: Pt) -> Pt | None:
@@ -392,24 +430,54 @@ def sample_elements(elements, max_err: float = 1.0) -> list[Pt]:
 
 def _tangent(ca, ra: float, cb, rb: float) -> tuple[np.ndarray, np.ndarray]:
     """Line leaving circle a and reaching circle b. Radii are signed: > 0 when the path
-    turns left (counter-clockwise) around that circle."""
+    turns left (counter-clockwise) around that circle. Raises _NoTangent if there is none."""
     dx, dy = cb - ca
     L = math.hypot(dx, dy)
     k = rb - ra
-    if L <= abs(k) + 1e-6:
+    if L <= abs(k) + TOUCH_TOL:
         if abs(k) - L > 200.0 or L < 1.0:
-            raise RubberBandError("arcs: no tangent between neighbouring corners", tuple(ca))
-        # the circles touch (an arc around a rounded corner, then one around the polygon
-        # point it ends on): go from one straight onto the other where they touch
+            raise _NoTangent()
+        # The circles touch (an arc track and the segment it runs into), or all but: go
+        # from one straight onto the other there. A tangent across a gap of a few nm
+        # between big circles would be a sliver microns long.
         u = np.array([dx, dy]) / L
-        if ra * rb > 0 and abs(rb) > abs(ra):
-            p = cb - abs(rb) * u
-        else:
-            p = ca + abs(ra) * u
+        if ra * rb > 0 and L > abs(k):
+            # one pokes out of the other by a few nm (pieces rounded to whole nm don't
+            # quite meet): switch where they cross, so the path stays outside both
+            p = _crossing(ca, ra, cb, rb)
+            if p is not None:
+                return p, p
+        p = cb - abs(rb) * u if ra * rb > 0 and abs(rb) > abs(ra) else ca + abs(ra) * u
         return p, p
     th = math.atan2(dy, dx) - math.asin(k / L)
     n = np.array([-math.sin(th), math.cos(th)])
     return ca - ra * n, cb - rb * n
+
+
+TOUCH_TOL = 10.0        # circles closer than this to touching are taken as touching
+
+
+class _NoTangent(Exception):
+    pass
+
+
+def _crossing(ca, ra: float, cb, rb: float):
+    """Where a path going round circle a (signed radius ra) runs into circle b: of the two
+    points where they cross, the one where carrying on round a would enter b."""
+    d = cb - ca
+    L = math.hypot(*d)
+    x = (L * L + ra * ra - rb * rb) / (2 * L)
+    h2 = ra * ra - x * x
+    if h2 < 0:
+        return None
+    u, h = d / L, math.sqrt(h2)
+    n = np.array([-u[1], u[0]])
+    for p in (ca + x * u + h * n, ca + x * u - h * n):
+        r = p - ca
+        along = math.copysign(1, ra) * np.array([-r[1], r[0]])     # direction round a
+        if np.dot(along, cb - p) > 0:
+            return p
+    return None
 
 
 def _turn(a: Pt, b: Pt, c: Pt) -> float:
@@ -419,265 +487,225 @@ def _turn(a: Pt, b: Pt, c: Pt) -> float:
     return math.atan2(u[0] * v[1] - u[1] * v[0], u[0] * v[0] + u[1] * v[1])
 
 
-def fit_arcs(path: Sequence[Pt], obstacles: Iterable[tuple], margin: float = 0.0,
-             fit_tol: float = ARC_FIT_TOL, min_sag: float = ARC_MIN_SAGITTA,
-             join_tol: float = ARC_JOIN_TOL, inside: bool = False, circles=None) -> list[tuple]:
-    """Replace the corners of a taut path (from pull_taut) by arcs.
+class _Wrap(NamedTuple):
+    centre: np.ndarray
+    radius: float           # > 0
+    sign: float             # +1: path turns left around it
+    turn: float | None      # turning of the pull_taut corners it replaces, if any
 
-    Every corner of a taut path lies on a grown obstacle, where the growing rounded a
-    point, a polygon corner or a track end. Consecutive corners around the same point
-    (or around one circle, for pads KiCad hands over as polygons) become one arc around
-    it, at the required distance plus `margin`, joined by exact tangents. Where the path
-    was capped closer than required (tighter original) the arc keeps that distance.
 
-    inside: keep each arc inside the segments it replaces instead (it then bulges
-    towards nothing the segments didn't; for runs squeezed between neighbours).
-    obstacles: as for pull_taut; a reference distance, if given, is ignored.
-    circles: per obstacle, (cx, cy, r, start angle, signed sweep) of the arc or circle it
-    approximates, or None. Corners around such a curve get its centre and radius instead
-    of ones fitted to its points, and clearance is checked against the true curve.
-    Returns [("line", a, b) | ("arc", a, mid, b)] from path[0] to path[-1].
-    Raises RubberBandError when the arcs would not fit; the caller keeps the segments.
+def exact_path(path: Sequence[Pt], obstacles: Iterable[tuple], tol: float = CHECK_TOL,
+               min_sag: float = ARC_MIN_SAGITTA, max_rounds: int = 40) -> list[tuple]:
+    """See _exact_path. Arcs get ROUNDING to spare on their radius (the caller rounds to
+    whole nm, and neighbouring pieces of rounded tracks don't quite meet); without it if
+    that doesn't fit (a squeeze at exactly the clearance on both sides)."""
+    try:
+        return _exact_path(path, obstacles, ROUNDING, tol, min_sag, max_rounds)
+    except RubberBandError:
+        return _exact_path(path, obstacles, 0.0, tol, min_sag, max_rounds)
+
+
+def _exact_path(path, obstacles, spare, tol, min_sag, max_rounds) -> list[tuple]:
+    """Exact lines and arcs for a taut path from pull_taut (same obstacles).
+
+    Each corner of the taut path lies where pull_taut's polygons round a feature of an
+    obstacle; consecutive corners on one feature become one wrap round it, at the exact
+    distance. Wraps are joined by exact tangents. The result is checked against the true
+    shapes: a feature it cuts into (the polygons missed it) is added as a wrap, a wrap it
+    no longer touches is dropped, until it is clear.
+
+    Returns [("line", a, b) | ("arc", a, mid, b)] from path[0] to path[-1]; arcs too flat
+    to survive rounding (under min_sag) become a corner where the tangents meet.
+    Raises RubberBandError when no clean path is found.
     """
     path = simplify_collinear(path)
+    start, end = path[0], path[-1]
     if len(path) < 3:
-        return [("line", path[0], path[-1])]
+        return [("line", start, end)]
     line = LineString(path)
-    obstacles = list(obstacles)
-    geoms = np.asarray([ob[0] for ob in obstacles], dtype=object)
-    d = np.asarray([ob[1] for ob in obstacles], dtype=float)
-    circles = list(circles) if circles is not None else [None] * len(obstacles)
-    if len(geoms):
-        near = shapely.distance(line, geoms) <= d * _BUF_SCALE + fit_tol + margin + 1000.0
-        geoms, d = geoms[near], d[near]
-        circles = [c for c, n in zip(circles, near) if n]
+    obs = [o if isinstance(o, Ob) else Ob(*o) for o in obstacles]
+    if obs:
+        geoms = np.asarray([o.geom for o in obs], dtype=object)
+        d = np.asarray([o.d for o in obs], dtype=float)
+        near = shapely.distance(line, geoms) <= d * _BUF_SCALE * 1.01 + SNAP_TOL + 10_000.0
+        obs = [o for o, n in zip(obs, near) if n]
+    geoms = np.asarray([o.geom for o in obs], dtype=object)
+    d = np.asarray([o.d for o in obs], dtype=float)
+    # true shapes for the clearance check: arcs as arcs, not the band standing in for them
+    check = np.asarray([LineString(arc_points(o.arc, CHECK_ERR)) if o.arc else o.geom for o in obs], dtype=object)
+    ref = np.asarray([o.ref if o.ref is not None else line.distance(c) for o, c in zip(obs, check)], dtype=float)
+    # never closer than the rules, or than the original where that was (clearly) closer;
+    # and no more than the fixed ends have, which can't move
+    ends = shapely.distance(shapely.points([start, end])[:, None], check[None, :]).min(axis=0) \
+        if len(obs) else ref
+    keep = np.minimum(np.where(ref >= d - SNAP_TOL, d, ref), ends)
 
-    # which obstacle each corner wraps: on the inside of the bend, on its grown outline
-    # (a neighbour on the outside can be as close). Where several fit (a track's arc and
-    # its next segment meet at one point), prefer a known curve, then the previous
-    # corner's obstacle: switching would split the arc.
+    def feature(k, v):
+        """(centre, radius) of the feature of obstacle k that point v wraps, or None."""
+        o = obs[k]
+        if o.arc is not None:
+            cx, cy, r, a0, sweep = o.arc
+            t = (math.atan2(v[1] - cy, v[0] - cx) - a0) * math.copysign(1, sweep) % (2 * math.pi)
+            if t <= abs(sweep) and math.hypot(v[0] - cx, v[1] - cy) > r:
+                return np.array([cx, cy]), r + keep[k] + spare
+            tips = [(cx + r * math.cos(a), cy + r * math.sin(a)) for a in (a0, a0 + sweep)]
+            return np.asarray(min(tips, key=lambda e: math.dist(e, v))), keep[k] + spare
+        g = o.geom
+        if g.geom_type == "Point":
+            return np.array([g.x, g.y]), keep[k] + spare
+        p = shapely.ops.nearest_points(g, Point(v))[0]
+        verts = shapely.get_coordinates(g)
+        j = int(np.argmin(np.hypot(verts[:, 0] - p.x, verts[:, 1] - p.y)))
+        if math.hypot(verts[j, 0] - p.x, verts[j, 1] - p.y) > 1.0:
+            return None         # on a straight side: nothing to wrap
+        return verts[j].copy(), keep[k] + spare
+
+    # the feature each corner wraps: on an obstacle's grown outline, inside the bend
     inner = path[1:-1]
-    corners = []        # (obstacle index or -1, centre of the grown rounding, distance, known circle)
-    D = shapely.distance(shapely.points(inner)[:, None], geoms[None, :]) if len(geoms) else None
+    turns = [_turn(path[i], path[i + 1], path[i + 2]) for i in range(len(inner))]
+    D = shapely.distance(shapely.points(inner)[:, None], geoms[None, :]) if len(obs) else None
+    wraps: list[_Wrap] = []
     for i, v in enumerate(inner):
-        prev_k = corners[-1][0] if corners else -1
-        corners.append((-1, v, 0.0, None))
         if D is None:
-            continue
+            break
         a, b = np.subtract(path[i], v), np.subtract(path[i + 2], v)
         inward = a / np.hypot(*a) + b / np.hypot(*b)
-        fits = []
         for k in np.argsort(D[i] / d):
             k = int(k)
             if D[i, k] > d[k] * _BUF_SCALE + 2.0:
                 break
-            c = shapely.ops.nearest_points(geoms[k], Point(v))[0]
-            if (c.x - v[0]) * inward[0] + (c.y - v[1]) * inward[1] > 0:
-                known = None
-                if circles[k] is not None:
-                    cx, cy, r = circles[k][:3]
-                    if abs(math.hypot(c.x - cx, c.y - cy) - r) <= join_tol:
-                        known = (cx, cy, r)
-                fits.append((known is None, k != prev_k, (k, (c.x, c.y), float(D[i, k]), known)))
-        if fits:
-            corners[-1] = min(fits, key=lambda f: f[:2])[2]
-    turns = [_turn(path[i], path[i + 1], path[i + 2]) for i in range(len(inner))]
-
-    def circle(idx, base=None):
-        """Arc for corners idx[0]..idx[-1]: ((centre, radius) or None, how many distinct
-        obstacle points they wrap, the fitted (centre, radius) of those points if any).
-        With `base` (a circle fitted to earlier corners), check the points against it
-        instead of fitting."""
-        cs = [corners[idx[0]][1]]
-        for i in idx[1:]:
-            if math.dist(cs[-1], corners[i][1]) > 1.0:
-                cs.append(corners[i][1])
-        fit = None
-        known = corners[idx[0]][3]
-        if known is not None:
-            if any(corners[i][3] != known for i in idx):
-                return None, len(cs), None
-            centre, rho = np.asarray(known[:2], dtype=float), known[2]
-        elif any(corners[i][3] is not None for i in idx):
-            return None, len(cs), None
-        elif base is not None:
-            # points close to a circle fitted to plenty of others: the ends of a curve
-            # read back as a band (its inside chords, the next track's end point)
-            centre, rho = base
-            if any(abs(math.dist(centre, c) - rho) > join_tol for c in cs):
-                return None, len(cs), None
-            fit = base
-        elif len(cs) == 1:
-            centre, rho = np.asarray(cs[0]), 0.0
-        elif len(cs) >= 4:     # any three points are on some circle
-            # the points must be a polygonised circle: on one circle (KiCad puts the vertices
-            # on the arc, so only rounding is allowed), and close enough together that the
-            # polygon stays within fit_tol of it (not a square's corners)
-            centre, resid = _fit_circle(cs)
-            rho = math.dist(centre, cs[0])
-            ang = [math.atan2(c[1] - centre[1], c[0] - centre[0]) for c in cs]
-            step = max(abs((b - a + math.pi) % (2 * math.pi) - math.pi) for a, b in zip(ang, ang[1:]))
-            if resid > 100.0 or rho * (1 - math.cos(step / 2)) > fit_tol:
-                return None, len(cs), None
-            fit = (centre, rho)
-        else:
-            return None, len(cs), None
-        if any(abs(math.dist(centre, inner[i]) - rho - corners[i][2]) > fit_tol for i in idx):
-            return None, len(cs), None
-        if known is None:   # cover every point; a known curve is exact
-            rho = max([rho] + [math.dist(centre, c) for c in cs])
-
-        def clearance(i):
-            # r_v below the required distance: pull_taut capped it at the original's (minus
-            # its eps of 2 nm); an original at the required distance gets that, not 2 nm less
-            k, r_v = corners[i][0], corners[i][2]
-            return d[k] + margin if r_v >= d[k] - 3.0 else r_v
-        rad = rho + max(clearance(i) for i in idx)
-        if inside:
-            around = LineString(path[idx[0]:idx[-1] + 3])     # the corners and their segments
-            rad = min(rad, around.distance(Point(centre)))
-        return (centre, rad), len(cs), fit
-
-    # group corners greedily into runs that turn the same way around one circle
-    groups = []         # (corner indices, (centre, radius) or None for a sharp corner)
-    i = 0
-    while i < len(inner):
-        k = corners[i][0]
-        if k < 0:
-            groups.append(([i], None))
-            i += 1
-            continue
-        best, base, j = ([i], circle([i])[0]), None, i + 1
-        while j < len(inner) and corners[j][0] >= 0 and abs(d[corners[j][0]] - d[k]) <= 1.0 \
-                and turns[j] * turns[i] > 0:
-            run = list(range(i, j + 1))
-            cand, n_points, fit = circle(run)
-            if cand is None and base is not None:
-                cand, n_points, fit = circle(run, base)
-                if cand is None:
-                    break
-            if cand is None:
-                if n_points >= 4:   # fewer points may still become a circle with more
-                    break
+            f = feature(k, v)
+            if f is None or np.dot(f[0] - v, inward) <= 0:
+                continue
+            s = math.copysign(1.0, turns[i])
+            last = wraps[-1] if wraps else None
+            if last and last.sign == s and math.dist(last.centre, f[0]) <= 1.0 and abs(last.radius - f[1]) <= 1.0:
+                wraps[-1] = last._replace(turn=last.turn + turns[i])
             else:
-                best = (run, cand)
-                base = fit or base
-            j += 1
-        groups.append(best)
-        i = best[0][-1] + 1
+                wraps.append(_Wrap(f[0], f[1], s, turns[i]))
+            break
 
-    def split(idx):
-        """One group per obstacle point."""
-        out = [[idx[0]]]
-        for i in idx[1:]:
-            if math.dist(corners[out[-1][-1]][1], corners[i][1]) <= 1.0:
-                out[-1].append(i)
-            else:
-                out.append([i])
-        return [(sub, circle(sub)[0]) for sub in out]
-
-    # known curves are checked as they are, not as the polygon standing in for them
-    check = geoms.copy()
-    for k, circ in enumerate(circles):
-        if circ is not None:
-            cx, cy, r, a0, sweep = circ
-            n = max(2, int(math.ceil(abs(sweep) / (2 * math.acos(max(-1.0, 1 - 1.0 / r)))))) if r > 1 else 2
-            check[k] = LineString([(cx + r * math.cos(a0 + sweep * i / n), cy + r * math.sin(a0 + sweep * i / n))
-                                   for i in range(n + 1)])
-
-    # A fitted circle can still be wrong just past the points it was fitted to (a few
-    # polygon points that happen to lie on one circle); then fall back to one arc per point.
-    while True:
+    for _ in range(max_rounds):
         try:
-            elements = _arc_elements(path, inner, turns, groups, min_sag)
-            if len(geoms):
-                # never closer to anything than the rules, or than the segments already were
-                curve = LineString(sample_elements(elements))
-                limit = np.minimum(d, shapely.distance(line, check)) - 5.0
-                bad = shapely.distance(curve, check) < limit
-                if bad.any():
-                    p = shapely.ops.nearest_points(curve, check[int(np.argmax(bad))])[0]
-                    raise _ArcFailure("arcs would violate clearance", (p.x, p.y), range(len(groups)))
-            return elements
-        except _ArcFailure as e:
-            redo = [g for g in e.groups if groups[g][1] is not None and corners[groups[g][0][0]][3] is None
-                    and len(split(groups[g][0])) > 1]      # a known circle is not a guess
-            if not redo:
-                raise RubberBandError(str(e), e.where) from None
-            for g in sorted(redo, reverse=True):
-                groups[g:g + 1] = split(groups[g][0])
+            elements, owner = _build(start, end, wraps, min_sag)
+        except _Drop as e:
+            del wraps[e.wrap]
+            continue
+        if len(obs):
+            pts = sample_elements(elements, CHECK_ERR)
+            curve = LineString(pts)
+            short = keep - tol - shapely.distance(curve, check)
+            if short.max() > 0:
+                k = int(np.argmax(short))
+                p = shapely.ops.nearest_points(curve, check[k])[0]
+                f = feature(k, (p.x, p.y))
+                if f is None:
+                    raise RubberBandError("would cut into an obstacle side", (p.x, p.y))
+                # which side, and between which wraps
+                xy = np.asarray(pts)
+                i = int(np.argmin(np.hypot(xy[:, 0] - p.x, xy[:, 1] - p.y)))
+                q0, q1 = pts[max(0, i - 1)], pts[min(len(pts) - 1, i + 1)]
+                s = 1.0 if _cross(q0, q1, tuple(f[0])) > 0 else -1.0
+                el = min(range(len(elements)), key=lambda j: LineString(sample_elements([elements[j]], 10.0))
+                         .distance(p))
+                kind, j = owner[el]
+                after = math.dist(elements[el][-1], (p.x, p.y)) < math.dist(elements[el][1], (p.x, p.y))
+                at = j if kind == "gap" else j + after
+                new = _Wrap(f[0], f[1], s, None)
+                if any(math.dist(w.centre, new.centre) <= 1.0 and abs(w.radius - new.radius) <= 1.0 and w.sign == s
+                       for w in wraps[max(0, at - 1):at + 1]):
+                    raise RubberBandError("would cut into an obstacle", (p.x, p.y))
+                wraps.insert(at, new)
+                continue
+        return elements
+    raise RubberBandError("no clean path found", start)
 
 
-class _ArcFailure(RubberBandError):
-    def __init__(self, msg: str, where, groups):
-        super().__init__(msg, where)
-        self.groups = list(groups)
+class _Drop(Exception):
+    def __init__(self, wrap: int):
+        self.wrap = wrap
 
 
-def _arc_elements(path, inner, turns, groups, min_sag) -> list[tuple]:
-    """Lines and arcs for fit_arcs: one circle per group of corners, joined by tangents."""
-    nodes = [(np.asarray(path[0], dtype=float), 0.0, None)]     # (centre, signed radius, corner idx)
-    for idx, circ in groups:
-        if circ is None:        # corner not on any obstacle: keep it sharp
-            nodes.append((np.asarray(inner[idx[0]], dtype=float), 0.0, idx))
-        else:
-            nodes.append((circ[0], math.copysign(circ[1], turns[idx[0]]), idx))
-    nodes.append((np.asarray(path[-1], dtype=float), 0.0, None))
-
+def _build(start, end, wraps, min_sag):
+    """Lines and arcs through `wraps`, and for each piece what it belongs to: ("gap", j)
+    = between wraps j - 1 and j (j = index a new wrap there would get), ("wrap", j) =
+    round wraps[j]. Raises _Drop for a wrap the path no longer touches."""
+    nodes = [(np.asarray(start, dtype=float), 0.0)] + [(w.centre, w.sign * w.radius) for w in wraps] + \
+        [(np.asarray(end, dtype=float), 0.0)]
     tangents = []
     for j in range(len(nodes) - 1):
-        (ca, ra, _), (cb, rb, _) = nodes[j], nodes[j + 1]
+        (ca, ra), (cb, rb) = nodes[j], nodes[j + 1]
         try:
             tangents.append(_tangent(ca, ra, cb, rb))
-        except RubberBandError as e:
-            raise _ArcFailure(str(e), e.where, [g for g in (j - 1, j) if 0 <= g < len(groups)]) from None
+        except _NoTangent:
+            # one circle inside the other (same way round): the inner one is not touched
+            if ra * rb > 0:
+                raise _Drop(j - 1 if abs(ra) < abs(rb) else j) from None
+            if ra == 0 or rb == 0:      # an end inside a wrap
+                raise _Drop(j if ra == 0 else j - 1) from None
+            raise RubberBandError("no room between two obstacles", tuple(ca)) from None
     pt = lambda p: (float(p[0]), float(p[1]))
-    elements = [("line", path[0], pt(tangents[0][1]))]
-    for j in range(1, len(nodes) - 1):
-        centre, srad, idx = nodes[j]
-        q_in, q_out = tangents[j - 1][1], tangents[j][0]
-        if srad != 0:
-            s = 1.0 if srad > 0 else -1.0
-            a_in = math.atan2(*(q_in - centre)[::-1])
-            sweep = (s * (math.atan2(*(q_out - centre)[::-1]) - a_in)) % (2 * math.pi)
-            turn = s * sum(turns[i] for i in idx)
-            sweep += 2 * math.pi * round((turn - sweep) / (2 * math.pi))    # full loops
-            if abs(sweep - turn) > 0.25:
-                raise _ArcFailure("arcs: arc does not match the corners it replaces", pt(centre), [j - 1])
-            R = abs(srad)
-            if R * (1 - math.cos(sweep / 2)) >= min_sag:
-                n = int(math.ceil(sweep / math.pi - 1e-9))     # KiCad arcs: keep each under a half turn
-                on = lambda a: (float(centre[0] + abs(srad) * math.cos(a)), float(centre[1] + abs(srad) * math.sin(a)))
-                ends = [pt(q_in)] + [on(a_in + s * sweep * m / n) for m in range(1, n)] + [pt(q_out)]
-                for m in range(n):
-                    elements.append(("arc", ends[m], on(a_in + s * sweep * (m + 0.5) / n), ends[m + 1]))
-            else:   # a corner where the tangents meet, a hair outside the arc
-                am = a_in + s * sweep / 2
-                q_out = centre + R / math.cos(sweep / 2) * np.array([math.cos(am), math.sin(am)])
-                elements[-1] = ("line", elements[-1][1], pt(q_out))
-        end = path[-1] if j == len(nodes) - 2 else pt(tangents[j][1])
-        elements.append(("line", pt(q_out), end))
-    if len(nodes) == 2:
-        elements = [("line", path[0], path[-1])]
-    return _tidy(elements, min_sag)
-
-
-def _tidy(elements, tol: float, short: float = 1000.0) -> list[tuple]:
-    """Merge straight pieces whose joint is less than `tol` off the line through their
-    ends (a kink within rounding), and fold pieces shorter than `short` into the one
-    before (left over from corners that only needed a sliver of arc)."""
-    out: list[list] = []
-    for e in elements:
-        e = list(e)
-        if out:
-            e[1] = out[-1][-1]
-            if e[0] == "line" and math.dist(e[1], e[2]) < short:
-                out[-1][-1] = e[2]
+    elements, owner = [("line", start, pt(tangents[0][1]))], [("gap", 0)]
+    for j, w in enumerate(wraps):
+        q_in, q_out = tangents[j][1], tangents[j + 1][0]
+        a_in = math.atan2(*(q_in - w.centre)[::-1])
+        sweep = (w.sign * (math.atan2(*(q_out - w.centre)[::-1]) - a_in)) % (2 * math.pi)
+        if w.turn is not None:      # full loops round it, as the taut path made them
+            sweep += 2 * math.pi * round((w.sign * w.turn - sweep) / (2 * math.pi))
+        elif sweep > math.pi:
+            sweep -= 2 * math.pi
+        if sweep < -1e-9:
+            raise _Drop(j)
+        R = w.radius
+        if R * (1 - math.cos(sweep / 2)) >= min_sag:
+            n = int(math.ceil(sweep / math.pi - 1e-9))     # KiCad arcs: keep each under a half turn
+            on = lambda a: (float(w.centre[0] + R * math.cos(a)), float(w.centre[1] + R * math.sin(a)))
+            ends = [pt(q_in)] + [on(a_in + w.sign * sweep * m / n) for m in range(1, n)] + [pt(q_out)]
+            for m in range(n):
+                elements.append(("arc", ends[m], on(a_in + w.sign * sweep * (m + 0.5) / n), ends[m + 1]))
+                owner.append(("wrap", j))
+        else:   # a corner where the tangents meet, a hair outside the arc
+            am = a_in + w.sign * sweep / 2
+            q_out = w.centre + R / math.cos(sweep / 2) * np.array([math.cos(am), math.sin(am)])
+            elements[-1] = (elements[-1][0], *elements[-1][1:-1], pt(q_out))
+        nxt = end if j == len(wraps) - 1 else pt(tangents[j + 1][1])
+        elements.append(("line", pt(q_out), nxt))
+        owner.append(("gap", j + 1))
+    # drop pieces of no length (touching circles), merge lines that are in line
+    out, own = [], []
+    for e, o in zip(elements, owner):
+        if e[0] == "line" and math.dist(e[1], e[2]) < 0.5:
+            continue
+        if out and e[0] == "line" and out[-1][0] == "line":
+            a, b, m = out[-1][1], e[2], e[1]
+            if math.dist(a, b) > 0 and abs(_cross(a, b, m)) / math.dist(a, b) < min_sag:
+                out[-1] = ("line", a, b)
                 continue
-            if e[0] == "line" and out[-1][0] == "line":
-                a, b = out[-1][1], e[2]
-                if math.dist(a, b) > 0 and abs(_cross(a, b, e[1])) / math.dist(a, b) < tol:
-                    out[-1][-1] = b
-                    continue
         out.append(e)
-    return [tuple(e) for e in out]
+        own.append(o)
+    if not out:
+        out, own = [("line", start, end)], [("gap", 0)]
+    return out, own
+
+
+def element_arc(e):
+    """(cx, cy, r, a0, signed sweep) of an ("arc", a, mid, b) element, None if straight."""
+    a, m, b = e[1:]
+    c = _circumcentre(a, m, b)
+    if c is None:
+        return None
+    a0 = math.atan2(a[1] - c[1], a[0] - c[0])
+    sweep = (math.atan2(b[1] - c[1], b[0] - c[0]) - a0) % (2 * math.pi)
+    if (math.atan2(m[1] - c[1], m[0] - c[0]) - a0) % (2 * math.pi) > sweep:
+        sweep -= 2 * math.pi
+    return c[0], c[1], math.dist(c, a), a0, sweep
+
+
+def min_margin(elements, obstacles) -> float:
+    """Smallest (distance - required) of `elements` to the true shapes of `obstacles`."""
+    obs = [o if isinstance(o, Ob) else Ob(*o) for o in obstacles]
+    if not obs:
+        return math.inf
+    curve = LineString(sample_elements(elements, CHECK_ERR))
+    check = np.asarray([LineString(arc_points(o.arc, CHECK_ERR)) if o.arc else o.geom for o in obs], dtype=object)
+    return float((shapely.distance(curve, check) - np.asarray([o.d for o in obs])).min())

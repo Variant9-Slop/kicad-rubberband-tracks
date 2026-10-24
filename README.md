@@ -26,10 +26,11 @@ Run DRC and refill zones afterwards.
 - Never gets closer to anything than the rules require, or than the original track already was.
 - A run that can't get shorter is still replaced if it comes out in fewer pieces: a
   straight line with a slight notch, or a curve drawn as many short segments.
-- Bends around vias, holes, pad corners (sharp or rounded) and track ends become arcs at
-  the required clearance plus 1 µm, joined by straight tangents. A run that doesn't come
-  out clean (arcs don't fit, or a straight piece under 10 µm) is left as it was and listed
-  in the popup with its location (`USE_ARCS = False` turns arcs off).
+- Output is exact: straight lines and arcs round vias, holes, pad corners (sharp or
+  rounded), track ends and other arcs, at the required clearance. A run that can't be made
+  clean is left as it was and listed in the popup with its location.
+- Tracks that miss the clearance by a hair (up to 2 µm, as earlier versions of this plugin
+  could leave them) are pushed out to the rule when you run it on them.
 
 Settings are at the top of `plugin/rubberband_action.py`.
 

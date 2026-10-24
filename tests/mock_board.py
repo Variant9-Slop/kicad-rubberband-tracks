@@ -6,6 +6,7 @@ from pathlib import Path
 
 from kipy.board_types import ArcTrack, BoardLayer, BoardSegment, Net, Pad, Track, Via
 from kipy.geometry import PolygonWithHoles, PolyLine, PolyLineNode, Vector2
+from kipy.proto.board import board_types_pb2
 from kipy.project_types import NetClass
 from shapely.geometry import box
 
@@ -56,6 +57,10 @@ def pad(x, y, net_name, size=1.0, height=None):
     poly = PolygonWithHoles()
     poly.outline = outline
     p._mock_poly = poly
+    # the pad stack says the same: a rectangle of that size (the plugin checks the two agree)
+    cl = p.proto.pad_stack.copper_layers[0]
+    cl.shape = board_types_pb2.PSS_RECTANGLE
+    cl.size.x_nm, cl.size.y_nm = int(round(size * MM)), int(round(height * MM))
     return p
 
 
@@ -143,14 +148,14 @@ def run(board) -> rubberband_action.RubberBand:
 
 def created_path(board, net_name=None):
     """Points of the created tracks (in mm), in creation order; arcs are followed to
-    within 1 nm."""
+    within 0.05 nm."""
     el = []
     for t in board.created:
         if net_name is None or t.net.name == net_name:
             xy = lambda v: (v.x, v.y)
             el.append(("arc", xy(t.start), xy(t.mid), xy(t.end)) if isinstance(t, ArcTrack)
                       else ("line", xy(t.start), xy(t.end)))
-    return [(x / MM, y / MM) for x, y in sample_elements(el)]
+    return [(x / MM, y / MM) for x, y in sample_elements(el, 0.05)]
 
 
 def created_arcs(board, net_name=None):
