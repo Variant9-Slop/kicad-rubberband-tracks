@@ -51,13 +51,20 @@ and extent when `geom` is a band standing in for an arc.
    distance (never tighter than the original); capped by the fixed ends' distance. So
    re-running on tracks a hair too close (older versions) puts them right.
 
+Plugin, runs: a work queue (shortest run first). A result is accepted when computed, or
+not at all (neighbours are fitted against what a run is, so that must be what gets
+written): if it fixes a violation, has fewer pieces and is not longer, is > 1 µm shorter
+without more pieces, or is > `BIG_GAIN` shorter. Accepting requeues the neighbours. A
+failed redo keeps the last accepted result. Dynamic arcs are coarse bands (topology
+only); the exact check uses the true arcs.
+
 Plugin: pads are exact shapes from the pad stack (circle/oval/rect/roundrect: skeleton +
 corner radius), used only if they match KiCad's polygon (Hausdorff ≤ 2·`PAD_POLY_ERROR`),
 else that polygon. Arcs on the board are bands (`arc_band`: chords inside, tangents
 outside) plus their true circle. Neighbouring selected runs are passed to each other as
 their exact elements. A run is written if shorter, in fewer pieces, or fixing a
-violation; if it can't be made clean (incl. a straight piece under `MIN_SEGMENT`) it is
-left alone and reported. `USE_ARCS = False` writes the taut polyline instead (coarse:
+violation (see above); if it can't be made clean (incl. a straight piece under
+`MIN_SEGMENT`) it is left alone and reported. `USE_ARCS = False` writes the taut polyline instead (coarse:
 can be ~0.07 % of the distance inside a capped obstacle).
 
 Units are nanometres throughout (KiCad's internal unit).
@@ -69,6 +76,8 @@ Units are nanometres throughout (KiCad's internal unit).
   (`API_HANDLER_EDITOR::checkForBusy` in `_eeschema.kiface`). Writes are two requests
   instead: create new tracks, then remove old ones (two undo steps).
 - kipy's default request timeout is 2 s; the client is created with `API_TIMEOUT_MS`.
+- Only one run at a time (`_single_instance`, an OS file lock): two at once both write.
+  Progress window and Cancel are tkinter (`_Progress`), silently absent without it.
 - Shapely buffers are polygons whose edges fall inside the true offset; `_BUF_SCALE`
   compensates (GEOS steps can be ~1.5× the nominal angle — measured, don't lower it).
 - Board rules (hole/edge/min clearance) aren't exposed by the KiCad 10 API; they are read

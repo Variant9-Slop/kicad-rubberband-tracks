@@ -13,8 +13,10 @@ import json
 import math
 import os
 import sys
+import tempfile
+import time
 import traceback
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
@@ -39,7 +41,7 @@ EXTRA_MARGIN = 0               # added on top of every clearance (use for custom
 DEFAULT_CLEARANCE = 200_000    # used when a net class has no clearance set
 EDGE_CLEARANCE = None          # None = board setting "copper to edge clearance" (.kicad_pro)
 HOLE_CLEARANCE = None          # None = board setting "copper to hole clearance" (.kicad_pro)
-MAX_PASSES = 8                 # with several selected nets: repeat until nothing improves
+MAX_REDOS = 50                 # runs are redone when a neighbour moves; cap per run, on average
 API_TIMEOUT_MS = 120_000       # per request; large boards need more than the 2 s default
 AVOID_COPPER_ZONES = False     # False: zones of other nets are ignored (they refill around you)
 ARC_MAX_ERROR = 1_000          # chord error when turning arcs into segments
@@ -48,6 +50,7 @@ QUAD_SEGS = 32                 # circle resolution for Edge.Cuts circles
 USE_ARCS = True                # exact lines and arcs; False: the plain segments pull_taut finds
 MIN_SEGMENT = 10_000           # a result with a shorter straight piece is a sliver: run left as is
 VIOLATION_TOL = 5              # an original closer than required by more than this may be fixed
+BIG_GAIN = 50_000              # a result in more pieces is taken only if it is this much shorter
 
 
 def _xy(v: Vector2) -> tuple[int, int]:
@@ -524,7 +527,7 @@ class RubberBand:
                 if arc is None:
                     out.append(Ob(LineString([e[1], e[-1]]), d))
                 else:
-                    out.append(Ob(arc_band(arc, 10.0), d, None, arc))
+                    out.append(Ob(arc_band(arc, ARC_MAX_ERROR), d, None, arc))
         return out
 
     def _report(self, ch, e):
@@ -548,6 +551,17 @@ class RubberBand:
                 mid = None      # mid < 1.5 nm off the chord: rounding would bend it any which way
             out.append(("arc", cur, mid, stop) if mid else ("line", cur, stop))
             cur = stop
+        # A line of a few nm (an arc ending a hair before the run's end, which sits exactly
+        # at the clearance) is folded into the piece before it.
+        for k in range(len(out) - 1, 0, -1):
+            if out[k][0] == "line" and math.dist(out[k][1], out[k][2]) < 5:
+                out[k - 1] = (*out[k - 1][:-1], out[k][2])
+                del out[k]
+                if k < len(out):
+                    out[k] = (out[k][0], out[k - 1][-1], *out[k][2:])
+        if len(out) > 1 and out[0][0] == "line" and math.dist(out[0][1], out[0][2]) < 5:
+            del out[0]
+            out[0] = (out[0][0], start, *out[0][2:])
         for e in out:
             if len(out) > 1 and e[0] == "line" and math.dist(e[1], e[2]) < MIN_SEGMENT:
                 raise RubberBandError(f"it would need a {math.dist(e[1], e[2]) / 1000:.1f} um straight piece", e[1])
@@ -561,7 +575,10 @@ class RubberBand:
             self.messages.append("Select one or more track segments first.")
             return
 
+        progress = getattr(self, "progress", None) or _NoProgress()
+        progress.show("Reading the board…")
         self.load()
+        progress.show("Preparing runs…")
         moving = {t.id.value for t in selected}
         chains = []
         for layer, net, width, items, pts in self.chains(selected):
@@ -573,8 +590,7 @@ class RubberBand:
             elements = _item_elements(items, pts[0])
             chains.append(dict(layer=layer, net=net, width=width, items=items, orig=list(pts),
                                cur=list(pts), orig_elements=elements, elements=elements, new=False,
-                               static=static, region=region, error=None,
-                               changed_at=0, done_at=-1, neighbours=[]))
+                               static=static, region=region, error=None, neighbours=[]))
 
         # neighbours = other-net runs on the same layer that can affect this one
         if chains:
@@ -585,50 +601,60 @@ class RubberBand:
                     if other is not ch and other["layer"] == ch["layer"] and other["net"] != ch["net"]:
                         ch["neighbours"].append(other)
 
-        # Each run is an obstacle for its neighbours, so repeat until no run gets shorter.
-        # After the first pass only runs next to something that moved are redone.
-        stamp = 0
-        for pass_no in range(MAX_PASSES):
-            improved = False
-            for ch in chains:
-                if len(ch["cur"]) < 3:
-                    continue
-                if pass_no > 0 and not any(nb["changed_at"] > ch["done_at"] for nb in ch["neighbours"]):
-                    continue
-                stamp += 1
-                ch["done_at"] = stamp
-                obstacles = ch["static"] + self._dynamic(ch)
-                try:
-                    new_pts = pull_taut([(float(x), float(y)) for x, y in ch["cur"]], obstacles)
-                except RubberBandError as e:
-                    ch["error"] = e
-                    continue
+        # Each run is an obstacle for its neighbours: when one gets shorter, the runs next to
+        # it are redone, until nothing changes. A change has to gain over 1 um, so this ends;
+        # MAX_REDOS is only a safety net.
+        # shortest first: an inner run of a bus then settles before the ones round it
+        queue = deque(sorted((ch for ch in chains if len(ch["cur"]) >= 3), key=lambda ch: path_length(ch["orig"])))
+        queued = {id(ch) for ch in queue}
+        first, done = len(queue), 0
+        while queue and done < MAX_REDOS * max(1, first):
+            if progress.cancelled:
+                self.messages.append("Cancelled; nothing was changed.")
+                return
+            ch = queue.popleft()
+            queued.discard(id(ch))
+            done += 1
+            if done <= first:
+                progress.show(f"Tightening run {done} of {first}…", done / first)
+            else:
+                progress.show(f"Runs next to ones that moved: {len(queue) + 1} to redo…",
+                              done / (done + len(queue)))
+            obstacles = ch["static"] + self._dynamic(ch)
+            try:
+                new_pts = pull_taut([(float(x), float(y)) for x, y in ch["cur"]], obstacles)
                 ipts = [(int(round(x)), int(round(y))) for x, y in new_pts]
                 ipts[0], ipts[-1] = ch["orig"][0], ch["orig"][-1]
                 ipts = [p for i, p in enumerate(ipts) if i == 0 or p != ipts[i - 1]]
-                # Take the taut path even when it is barely shorter (a 179 degree notch, a
-                # curve made of segments): it is what the exact path is built from. Only a
-                # real gain (> 1 um) counts as a change that the neighbours have to follow.
-                gain = path_length(ch["cur"]) - path_length(ipts)
-                if gain < -2:       # longer, give or take rounding
+                # Go on even when the taut path is barely shorter (a 179 degree notch, a
+                # curve made of segments): the exact path is built from it.
+                if path_length(ipts) > path_length(ch["cur"]) + 2:     # longer, beyond rounding
                     continue
-                ch["cur"] = ipts
-                try:
-                    if USE_ARCS:
-                        exact = exact_path([(float(x), float(y)) for x, y in ipts], obstacles)
-                    else:
-                        exact = [("line", a, b) for a, b in zip(ipts, ipts[1:])]
-                    ch["elements"] = self._rounded(exact, ch["orig"][0], ch["orig"][-1])
-                    ch["new"], ch["error"] = True, None
-                except RubberBandError as e:
+                if USE_ARCS:
+                    exact = exact_path([(float(x), float(y)) for x, y in ipts], obstacles)
+                else:
+                    exact = [("line", a, b) for a, b in zip(ipts, ipts[1:])]
+                elements = self._rounded(exact, ch["orig"][0], ch["orig"][-1])
+            except RubberBandError as e:
+                # A redo that fails keeps the last result: neighbours that moved since were
+                # fitted against it. Only a run that never worked is left as it was.
+                if not ch["new"]:
                     ch["error"] = e
-                    continue
-                if gain > 1000:
-                    stamp += 1
-                    ch["changed_at"] = stamp
-                    improved = True
-            if not improved:
-                break
+                continue
+            # Accept it now, or not at all: neighbours are fitted against what this run is,
+            # so that has to be what gets written.
+            old = ch["elements"]
+            exact_gain = path_length(sample_elements(old, 10.0)) - path_length(sample_elements(elements, 10.0))
+            more = len(elements) - len(old)
+            fixed = min_margin(old, ch["static"]) < -VIOLATION_TOL <= min_margin(elements, ch["static"])
+            if not (fixed or (more < 0 and exact_gain > -2) or (more <= 0 and exact_gain > 1000)
+                    or exact_gain > BIG_GAIN):
+                continue
+            ch["cur"], ch["elements"], ch["new"], ch["error"] = ipts, elements, True, None
+            for nb in ch["neighbours"]:
+                if id(nb) not in queued and len(nb["cur"]) >= 3:
+                    queue.append(nb)
+                    queued.add(id(nb))
 
         to_remove, to_create = [], []
         for ch in chains:
@@ -637,14 +663,7 @@ class RubberBand:
                 continue
             if not ch["new"]:
                 continue
-            # replace the run if it gets shorter, comes out in fewer pieces, or no longer
-            # misses the clearance by a hair (as older versions of this plugin left it)
-            elements, orig = ch["elements"], ch["orig_elements"]
-            shorter = path_length(sample_elements(elements, 10.0)) < path_length(sample_elements(orig, 10.0)) - 1000
-            fewer = len(elements) < len(ch["items"])
-            fixed = min_margin(orig, ch["static"]) < -VIOLATION_TOL <= min_margin(elements, ch["static"])
-            if not (shorter or fewer or fixed):
-                continue
+            elements = ch["elements"]
             to_remove.extend(ch["items"])
             for el in elements:
                 nt = ArcTrack() if el[0] == "arc" else Track()
@@ -666,6 +685,10 @@ class RubberBand:
         # route them to the schematic editor's handler, which crashes KiCad. Without a
         # commit each request is its own undo step, so send exactly two: create the new
         # tracks first (a failure then leaves the old ones in place), then remove the old.
+        if progress.cancelled:
+            self.messages[:] = ["Cancelled; nothing was changed."]
+            return
+        progress.show("Writing tracks…")
         created = list(self.board.create_items(to_create))
         self.board.remove_items(to_remove)
         try:
@@ -673,6 +696,88 @@ class RubberBand:
             self.board.add_to_selection(created)
         except Exception:
             pass
+
+
+class _NoProgress:
+    cancelled = False
+
+    def show(self, text, fraction=None):
+        pass
+
+    def close(self):
+        pass
+
+
+class _Progress(_NoProgress):
+    """A small window with a progress bar and Cancel (tkinter; nothing if unavailable)."""
+
+    def __init__(self):
+        self.root, self._last = None, 0.0
+        try:
+            import tkinter
+            from tkinter import ttk
+            root = tkinter.Tk()
+            root.title("Rubber band")
+            root.resizable(False, False)
+            root.attributes("-topmost", True)
+            frame = ttk.Frame(root, padding=12)
+            frame.pack()
+            self.label = ttk.Label(frame, text="", width=46)
+            self.label.pack(anchor="w")
+            self.bar = ttk.Progressbar(frame, length=340, maximum=1.0)
+            self.bar.pack(pady=8)
+            ttk.Button(frame, text="Cancel", command=self._cancel).pack(anchor="e")
+            root.protocol("WM_DELETE_WINDOW", self._cancel)
+            self.root = root
+        except Exception:
+            self.root = None
+
+    def _cancel(self):
+        self.cancelled = True
+        self.show("Cancelling…")
+
+    def show(self, text, fraction=None):
+        if self.root is None:
+            return
+        now = time.monotonic()
+        if fraction is not None and 0 < fraction < 1 and now - self._last < 0.05:
+            return
+        self._last = now
+        try:
+            self.label.config(text=text)
+            self.bar.config(mode="determinate" if fraction is not None else "indeterminate")
+            if fraction is not None:
+                self.bar["value"] = fraction
+            else:
+                self.bar.step(0.05)
+            self.root.update()
+        except Exception:
+            self.root = None
+
+    def close(self):
+        if self.root is not None:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            self.root = None
+
+
+def _single_instance():
+    """An exclusive lock held while this process runs (released when it exits, even on a
+    crash), or None if another run has it: two runs at once would both write tracks."""
+    f = open(os.path.join(tempfile.gettempdir(), "rubberband-tracks.lock"), "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
 
 
 def _notify(msg: str):
@@ -689,13 +794,23 @@ def _notify(msg: str):
 
 
 def main():
+    lock = _single_instance()
+    if lock is None:
+        _notify("Rubber band is already running; wait for it to finish.")
+        return
+    progress = _Progress()
     try:
         rb = RubberBand()
+        rb.progress = progress
         rb.run()
+        progress.close()
         if rb.messages:
             _notify("\n".join(rb.messages))
     except Exception:
+        progress.close()
         _notify("Rubber band failed:\n\n" + traceback.format_exc())
+    finally:
+        lock.close()
 
 
 if __name__ == "__main__":

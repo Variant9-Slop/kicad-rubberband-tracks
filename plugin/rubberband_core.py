@@ -22,6 +22,7 @@ from typing import Iterable, NamedTuple, Sequence
 
 import numpy as np
 import shapely
+import shapely.ops
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 from shapely.strtree import STRtree
 
@@ -345,6 +346,7 @@ ARC_MIN_SAGITTA = 3.0   # flatter arcs (nm off their chord) become a corner: rou
 SNAP_TOL = 2_000.0      # an original this close to the required distance counts as meant to be at it
 ROUNDING = 2.0          # added to exact distances: the caller rounds to whole nm
 CHECK_ERR = 0.1         # curves are checked as chords this close to them
+COARSE_ERR = 1_000.0    # ... after a first look at this resolution
 CHECK_TOL = 5.0         # allowed shortfall (nm): other tracks are on whole nm, their pieces
                         # don't quite meet; KiCad's DRC ignores far more (its epsilon, 0.5 um)
 
@@ -492,6 +494,7 @@ class _Wrap(NamedTuple):
     radius: float           # > 0
     sign: float             # +1: path turns left around it
     turn: float | None      # turning of the pull_taut corners it replaces, if any
+    at: float               # where along the taut path it comes
 
 
 def exact_path(path: Sequence[Pt], obstacles: Iterable[tuple], tol: float = CHECK_TOL,
@@ -533,6 +536,7 @@ def _exact_path(path, obstacles, spare, tol, min_sag, max_rounds) -> list[tuple]
     d = np.asarray([o.d for o in obs], dtype=float)
     # true shapes for the clearance check: arcs as arcs, not the band standing in for them
     check = np.asarray([LineString(arc_points(o.arc, CHECK_ERR)) if o.arc else o.geom for o in obs], dtype=object)
+    coarse = np.asarray([LineString(arc_points(o.arc, COARSE_ERR)) if o.arc else o.geom for o in obs], dtype=object)
     ref = np.asarray([o.ref if o.ref is not None else line.distance(c) for o, c in zip(obs, check)], dtype=float)
     # never closer than the rules, or than the original where that was (clearly) closer;
     # and no more than the fixed ends have, which can't move
@@ -540,14 +544,18 @@ def _exact_path(path, obstacles, spare, tol, min_sag, max_rounds) -> list[tuple]
         if len(obs) else ref
     keep = np.minimum(np.where(ref >= d - SNAP_TOL, d, ref), ends)
 
-    def feature(k, v):
-        """(centre, radius) of the feature of obstacle k that point v wraps, or None."""
+    def feature(k, v, side_end=False):
+        """(centre, radius) of the feature of obstacle k that point v wraps, or None. With
+        side_end, a point beside a straight side gives that side's nearer end: a path
+        cutting into the side has to go round that end (or, failing that, the other)."""
         o = obs[k]
         if o.arc is not None:
             cx, cy, r, a0, sweep = o.arc
             t = (math.atan2(v[1] - cy, v[0] - cx) - a0) * math.copysign(1, sweep) % (2 * math.pi)
-            if t <= abs(sweep) and math.hypot(v[0] - cx, v[1] - cy) > r:
-                return np.array([cx, cy]), r + keep[k] + spare
+            if t <= abs(sweep):
+                if math.hypot(v[0] - cx, v[1] - cy) > r:
+                    return np.array([cx, cy]), r + keep[k] + spare
+                return None     # its concave side: nothing there to go round
             tips = [(cx + r * math.cos(a), cy + r * math.sin(a)) for a in (a0, a0 + sweep)]
             return np.asarray(min(tips, key=lambda e: math.dist(e, v))), keep[k] + spare
         g = o.geom
@@ -557,19 +565,34 @@ def _exact_path(path, obstacles, spare, tol, min_sag, max_rounds) -> list[tuple]
         verts = shapely.get_coordinates(g)
         j = int(np.argmin(np.hypot(verts[:, 0] - p.x, verts[:, 1] - p.y)))
         if math.hypot(verts[j, 0] - p.x, verts[j, 1] - p.y) > 1.0:
-            return None         # on a straight side: nothing to wrap
+            if not side_end:
+                return None     # on a straight side: nothing to wrap
+            # the side p is on: consecutive vertices it lies between
+            q = np.array([p.x, p.y])
+            for a, b in zip(verts, verts[1:]):
+                ab = b - a
+                t = np.dot(q - a, ab) / max(np.dot(ab, ab), 1e-9)
+                if 0 <= t <= 1 and np.hypot(*(a + t * ab - q)) <= 1.0:
+                    near_end = a if t < 0.5 else b
+                    if not any(math.dist(w.centre, near_end) <= 1.0 for w in wraps):
+                        return near_end.copy(), keep[k] + spare
+                    return (b if t < 0.5 else a).copy(), keep[k] + spare
+            return None
         return verts[j].copy(), keep[k] + spare
 
     # the feature each corner wraps: on an obstacle's grown outline, inside the bend
     inner = path[1:-1]
+    along = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(np.asarray(path, dtype=float), axis=0).T))])
     turns = [_turn(path[i], path[i + 1], path[i + 2]) for i in range(len(inner))]
     D = shapely.distance(shapely.points(inner)[:, None], geoms[None, :]) if len(obs) else None
     wraps: list[_Wrap] = []
     for i, v in enumerate(inner):
         if D is None:
             break
-        a, b = np.subtract(path[i], v), np.subtract(path[i + 2], v)
-        inward = a / np.hypot(*a) + b / np.hypot(*b)
+        # inside = the side it turns to (not the bisector: on an almost straight corner
+        # that is a near-zero vector pointing anywhere)
+        chord = np.subtract(path[i + 2], path[i])
+        inward = math.copysign(1.0, turns[i]) * np.array([-chord[1], chord[0]])
         for k in np.argsort(D[i] / d):
             k = int(k)
             if D[i, k] > d[k] * _BUF_SCALE + 2.0:
@@ -582,43 +605,57 @@ def _exact_path(path, obstacles, spare, tol, min_sag, max_rounds) -> list[tuple]
             if last and last.sign == s and math.dist(last.centre, f[0]) <= 1.0 and abs(last.radius - f[1]) <= 1.0:
                 wraps[-1] = last._replace(turn=last.turn + turns[i])
             else:
-                wraps.append(_Wrap(f[0], f[1], s, turns[i]))
+                wraps.append(_Wrap(f[0], f[1], s, turns[i], float(along[i + 1])))
             break
 
     for _ in range(max_rounds):
         try:
-            elements, owner = _build(start, end, wraps, min_sag)
+            elements = _build(start, end, wraps, min_sag)
         except _Drop as e:
             del wraps[e.wrap]
             continue
         if len(obs):
-            pts = sample_elements(elements, CHECK_ERR)
-            curve = LineString(pts)
-            short = keep - tol - shapely.distance(curve, check)
+            pts, short = _shortfall(elements, check, coarse, keep, tol)
             if short.max() > 0:
+                curve = LineString(pts)
                 k = int(np.argmax(short))
                 p = shapely.ops.nearest_points(curve, check[k])[0]
-                f = feature(k, (p.x, p.y))
+                f = feature(k, (p.x, p.y), side_end=True)
                 if f is None:
                     raise RubberBandError("would cut into an obstacle side", (p.x, p.y))
-                # which side, and between which wraps
-                xy = np.asarray(pts)
-                i = int(np.argmin(np.hypot(xy[:, 0] - p.x, xy[:, 1] - p.y)))
-                q0, q1 = pts[max(0, i - 1)], pts[min(len(pts) - 1, i + 1)]
-                s = 1.0 if _cross(q0, q1, tuple(f[0])) > 0 else -1.0
-                el = min(range(len(elements)), key=lambda j: LineString(sample_elements([elements[j]], 10.0))
-                         .distance(p))
-                kind, j = owner[el]
-                after = math.dist(elements[el][-1], (p.x, p.y)) < math.dist(elements[el][1], (p.x, p.y))
-                at = j if kind == "gap" else j + after
-                new = _Wrap(f[0], f[1], s, None)
+                # which side, and where in the order: from the taut path, which has the
+                # right topology (the broken one may run right through the obstacle)
+                t = line.project(Point(f[0]))
+                o, q = line.interpolate(max(0.0, t - 10.0)), line.interpolate(min(line.length, t + 10.0))
+                s = 1.0 if _cross((o.x, o.y), (q.x, q.y), tuple(f[0])) > 0 else -1.0
+                new = _Wrap(f[0], f[1], s, None, t)
                 if any(math.dist(w.centre, new.centre) <= 1.0 and abs(w.radius - new.radius) <= 1.0 and w.sign == s
-                       for w in wraps[max(0, at - 1):at + 1]):
+                       for w in wraps):
                     raise RubberBandError("would cut into an obstacle", (p.x, p.y))
+                at = next((j for j, w in enumerate(wraps) if w.at > t), len(wraps))
                 wraps.insert(at, new)
                 continue
         return elements
     raise RubberBandError("no clean path found", start)
+
+
+def _shortfall(elements, check, coarse, keep, tol):
+    """Path samples (fine), and per obstacle how far it comes inside keep - tol (> 0 =
+    too close). Obstacles clearly far enough on a coarse look are not checked finely, and
+    the fine check only looks at the part of the path near the obstacle."""
+    rough = LineString(sample_elements(elements, COARSE_ERR))
+    near = shapely.distance(rough, coarse) - 2 * COARSE_ERR < keep - tol
+    pts = sample_elements(elements, CHECK_ERR)
+    short = np.full(len(check), -math.inf)
+    if near.any():
+        curve = LineString(pts)
+        for k in np.nonzero(near)[0]:
+            x0, y0, x1, y1 = check[k].bounds
+            m = keep[k] + 2 * COARSE_ERR
+            part = shapely.clip_by_rect(curve, x0 - m, y0 - m, x1 + m, y1 + m)
+            if not part.is_empty:
+                short[k] = keep[k] - tol - shapely.distance(part, check[k])
+    return pts, short
 
 
 class _Drop(Exception):
@@ -627,9 +664,7 @@ class _Drop(Exception):
 
 
 def _build(start, end, wraps, min_sag):
-    """Lines and arcs through `wraps`, and for each piece what it belongs to: ("gap", j)
-    = between wraps j - 1 and j (j = index a new wrap there would get), ("wrap", j) =
-    round wraps[j]. Raises _Drop for a wrap the path no longer touches."""
+    """Lines and arcs through `wraps`. Raises _Drop for a wrap the path no longer touches."""
     nodes = [(np.asarray(start, dtype=float), 0.0)] + [(w.centre, w.sign * w.radius) for w in wraps] + \
         [(np.asarray(end, dtype=float), 0.0)]
     tangents = []
@@ -645,7 +680,7 @@ def _build(start, end, wraps, min_sag):
                 raise _Drop(j if ra == 0 else j - 1) from None
             raise RubberBandError("no room between two obstacles", tuple(ca)) from None
     pt = lambda p: (float(p[0]), float(p[1]))
-    elements, owner = [("line", start, pt(tangents[0][1]))], [("gap", 0)]
+    elements = [("line", start, pt(tangents[0][1]))]
     for j, w in enumerate(wraps):
         q_in, q_out = tangents[j][1], tangents[j + 1][0]
         a_in = math.atan2(*(q_in - w.centre)[::-1])
@@ -663,17 +698,15 @@ def _build(start, end, wraps, min_sag):
             ends = [pt(q_in)] + [on(a_in + w.sign * sweep * m / n) for m in range(1, n)] + [pt(q_out)]
             for m in range(n):
                 elements.append(("arc", ends[m], on(a_in + w.sign * sweep * (m + 0.5) / n), ends[m + 1]))
-                owner.append(("wrap", j))
         else:   # a corner where the tangents meet, a hair outside the arc
             am = a_in + w.sign * sweep / 2
             q_out = w.centre + R / math.cos(sweep / 2) * np.array([math.cos(am), math.sin(am)])
             elements[-1] = (elements[-1][0], *elements[-1][1:-1], pt(q_out))
         nxt = end if j == len(wraps) - 1 else pt(tangents[j + 1][1])
         elements.append(("line", pt(q_out), nxt))
-        owner.append(("gap", j + 1))
     # drop pieces of no length (touching circles), merge lines that are in line
-    out, own = [], []
-    for e, o in zip(elements, owner):
+    out = []
+    for e in elements:
         if e[0] == "line" and math.dist(e[1], e[2]) < 0.5:
             continue
         if out and e[0] == "line" and out[-1][0] == "line":
@@ -682,10 +715,7 @@ def _build(start, end, wraps, min_sag):
                 out[-1] = ("line", a, b)
                 continue
         out.append(e)
-        own.append(o)
-    if not out:
-        out, own = [("line", start, end)], [("gap", 0)]
-    return out, own
+    return out or [("line", start, end)]
 
 
 def element_arc(e):

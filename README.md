@@ -15,7 +15,9 @@ Requires KiCad 9 or 10 (IPC API).
 
 ## Use
 
-Select track segments (one net or many) and click the button. Undo takes two steps.
+Select track segments (one net or many, or the whole board) and click the button. A
+progress window shows while it works (Cancel leaves the board untouched). Undo takes two
+steps.
 Run DRC and refill zones afterwards.
 
 - Run ends stay fixed at pads, vias, branches, width changes and unselected tracks.

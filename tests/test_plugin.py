@@ -404,3 +404,36 @@ def test_pad_shape_falls_back_when_it_disagrees_with_kicad():
     p, poly = _roundrect_pad(3, 4, 1.2, 0.6, 0.25, 30, poly_deg=60)
     geom, rho = rubberband_action._pad_shape(p, rubberband_action.BoardLayer.BL_F_Cu, poly)
     assert geom is poly and rho == rubberband_action.PAD_POLY_ERROR
+
+
+def test_one_run_settles_nested_traces(tmp_path):
+    # Twelve nested traces over a via, selected outermost first: each can only tighten
+    # once the one inside it has. A single run settles all of them; a second has nothing
+    # left to do (it used to stop after 8 passes).
+    n = 12
+
+    def U(k):
+        off = 0.45 * k
+        return [track((-off, 0), (-off, 3 + off), f"N{k}"), track((-off, 3 + off), (10 + off, 3 + off), f"N{k}"),
+                track((10 + off, 3 + off), (10 + off, 0), f"N{k}")]
+    runs = [U(k) for k in range(n)]
+    pads = [pad(x, 0, f"N{k}", .1) for k in range(n) for x in (-0.45 * k, 10 + 0.45 * k)]
+    sel = [t for r in reversed(runs) for t in r]
+    b = MockBoard(tmp_path, tracks=sel, pads=pads, vias=[via(5, 0, "V")], selection=sel)
+    assert run(b).messages == []
+    for t in b.created:
+        _set_id(t)
+    again = MockBoard(tmp_path, tracks=b.created, pads=pads, vias=[via(5, 0, "V")], selection=b.created)
+    assert run(again).messages == ["Nothing to change: selection is already taut."]
+
+
+def test_second_run_at_the_same_time_is_refused():
+    first = rubberband_action._single_instance()
+    try:
+        assert first is not None
+        assert rubberband_action._single_instance() is None
+    finally:
+        first.close()
+    second = rubberband_action._single_instance()
+    assert second is not None
+    second.close()
