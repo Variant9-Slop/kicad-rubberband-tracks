@@ -594,6 +594,7 @@ class RubberBand:
             elements = _item_elements(items, pts[0])
             chains.append(dict(layer=layer, net=net, width=width, items=items, orig=list(pts),
                                cur=list(pts), orig_elements=elements, elements=elements, new=False,
+                               length=path_length(sample_elements(elements, 10.0)),
                                static=static, region=region, error=None, neighbours=[], orig_gap={}))
 
         # neighbours = other-net runs on the same layer that can affect this one
@@ -613,6 +614,12 @@ class RubberBand:
         queue = deque(sorted((ch for ch in chains if len(ch["cur"]) >= 3), key=lambda ch: path_length(ch["orig"])))
         queued = {id(ch) for ch in queue}
         first, done = len(queue), 0
+        was = sum(ch["length"] for ch in chains)
+        now = was
+
+        def lengths():
+            return f"Total length {now / 1e6:.3f} mm (was {was / 1e6:.3f} mm, " \
+                   f"{(now - was) / was * 100 if was else 0.0:+.1f} %)"
         while queue and done < MAX_REDOS * max(1, first):
             if progress.cancelled:
                 self.messages.append("Cancelled; nothing was changed.")
@@ -621,10 +628,10 @@ class RubberBand:
             queued.discard(id(ch))
             done += 1
             if done <= first:
-                progress.show(f"Tightening run {done} of {first}…", done / first)
+                progress.show(f"Tightening run {done} of {first}…", done / first, lengths())
             else:
                 progress.show(f"Runs next to ones that moved: {len(queue) + 1} to redo…",
-                              done / (done + len(queue)))
+                              done / (done + len(queue)), lengths())
             obstacles = ch["static"] + self._dynamic(ch)
             try:
                 new_pts = pull_taut([(float(x), float(y)) for x, y in ch["cur"]], obstacles)
@@ -650,13 +657,16 @@ class RubberBand:
             # Accept it now, or not at all: neighbours are fitted against what this run is,
             # so that has to be what gets written.
             old = ch["elements"]
-            exact_gain = path_length(sample_elements(old, 10.0)) - path_length(sample_elements(elements, 10.0))
+            length = path_length(sample_elements(elements, 10.0))
+            exact_gain = ch["length"] - length
             more = len(elements) - len(old)
             fixed = min_margin(old, ch["static"]) < -VIOLATION_TOL <= min_margin(elements, ch["static"])
             if not (fixed or (more < 0 and exact_gain > -2) or (more <= 0 and exact_gain > 1000)
                     or exact_gain > BIG_GAIN):
                 continue
             ch["cur"], ch["elements"], ch["new"], ch["error"] = ipts, elements, True, None
+            now -= ch["length"] - length
+            ch["length"] = length
             for nb in ch["neighbours"]:
                 if id(nb) not in queued and len(nb["cur"]) >= 3:
                     queue.append(nb)
@@ -694,7 +704,7 @@ class RubberBand:
         if progress.cancelled:
             self.messages[:] = ["Cancelled; nothing was changed."]
             return
-        progress.show("Writing tracks…")
+        progress.show("Writing tracks…", None, lengths())
         created = list(self.board.create_items(to_create))
         self.board.remove_items(to_remove)
         try:
@@ -707,7 +717,7 @@ class RubberBand:
 class _NoProgress:
     cancelled = False
 
-    def show(self, text, fraction=None):
+    def show(self, text, fraction=None, detail=None):
         pass
 
     def close(self):
@@ -730,6 +740,8 @@ class _Progress(_NoProgress):
             frame.pack()
             self.label = ttk.Label(frame, text="", width=46)
             self.label.pack(anchor="w")
+            self.detail = ttk.Label(frame, text="", width=46)
+            self.detail.pack(anchor="w")
             self.bar = ttk.Progressbar(frame, length=340, maximum=1.0)
             self.bar.pack(pady=8)
             ttk.Button(frame, text="Cancel", command=self._cancel).pack(anchor="e")
@@ -742,7 +754,8 @@ class _Progress(_NoProgress):
         self.cancelled = True
         self.show("Cancelling…")
 
-    def show(self, text, fraction=None):
+    def show(self, text, fraction=None, detail=None):
+        """`detail`: a second line (the total length); None leaves it as it is."""
         if self.root is None:
             return
         now = time.monotonic()
@@ -751,6 +764,8 @@ class _Progress(_NoProgress):
         self._last = now
         try:
             self.label.config(text=text)
+            if detail is not None:
+                self.detail.config(text=detail)
             self.bar.config(mode="determinate" if fraction is not None else "indeterminate")
             if fraction is not None:
                 self.bar["value"] = fraction

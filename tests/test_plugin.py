@@ -29,6 +29,25 @@ def test_full_trace_hugs_via(tmp_path):
     assert len(b.removed) == 3
 
 
+def test_progress_shows_total_length(tmp_path):
+    class Recorder(rubberband_action._NoProgress):
+        def __init__(self):
+            self.details = []
+
+        def show(self, text, fraction=None, detail=None):
+            if detail is not None:
+                self.details.append(detail)
+
+    b, _ = around_via_board(tmp_path)
+    rb = rubberband_action.RubberBand.__new__(rubberband_action.RubberBand)
+    rb.board, rb.messages, rb.progress = b, [], Recorder()
+    rb.run()
+    first, last = rb.progress.details[0], rb.progress.details[-1]
+    assert first == "Total length 16.000 mm (was 16.000 mm, +0.0 %)"
+    new = sum(math.dist(a, c) for a, c in zip(created_path(b), created_path(b)[1:]))
+    assert last == f"Total length {new:.3f} mm (was 16.000 mm, {(new - 16) / 16 * 100:+.1f} %)"
+
+
 def test_already_straight_segment(tmp_path):
     b, _ = around_via_board(tmp_path, slice(1, 2))
     assert run(b).messages == ["Nothing to change: selection is already taut."]
