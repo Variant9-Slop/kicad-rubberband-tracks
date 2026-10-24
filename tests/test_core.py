@@ -10,7 +10,7 @@ from shapely.ops import unary_union
 import shapely
 
 from rubberband_core import (
-    Ob, RubberBandError, _circumcentre, _cross, arc_band, exact_path, path_length,
+    CHECK_TOL, Ob, RubberBandError, _circumcentre, _cross, arc_band, exact_path, path_length,
     pull_taut, sample_elements,
 )
 from rubberband_core import min_margin as exact_margin
@@ -303,3 +303,29 @@ def test_reference_keeps_full_clearance_despite_creep():
     assert exact_margin(el, [Ob(via, 1 * MM)]) >= 0
     crept = exact_path(taut, [Ob(via, 1 * MM)])           # default: the current distance
     assert exact_margin(crept, [Ob(via, 1 * MM)]) < -2000
+
+
+# Squeezes: a gap a few nm narrower than both sides want (neighbours are each allowed to
+# end up CHECK_TOL closer than asked). The shortfall is shared, so both sides stay within it.
+SQUEEZE = 7.0
+
+
+def test_squeeze_between_wrap_and_straight_side():
+    # over a via, under a straight track: the corridor is SQUEEZE short of 2 mm
+    d, y = 1 * MM, 1 * MM - SQUEEZE / 2
+    via, track = Point(5 * MM, 0), LineString([(3 * MM, 2 * MM - SQUEEZE), (7 * MM, 2 * MM - SQUEEZE)])
+    obs = [Ob(via, d, y), Ob(track, d, y)]
+    path = [(0, 0), (4 * MM, y), (6 * MM, y), (10 * MM, 0)]
+    el = solve(path, obs)
+    check_elements(el, [path[0], path[-1]], obs, tol=CHECK_TOL)
+
+
+def test_squeeze_between_opposite_wraps():
+    # under one via, over the other: their clearance circles overlap by SQUEEZE
+    d, L = 1 * MM, 2 * MM - SQUEEZE
+    m = (5 * MM, 5 * MM)
+    a, b = Point(m[0], m[1] - L / 2), Point(m[0], m[1] + L / 2)
+    obs = [Ob(a, d, L / 2), Ob(b, d, L / 2)]
+    path = [(m[0] + x * MM, m[1] + y * MM) for x, y in [(-3, 1.5), (-1, 0), (0, 0), (1, 0), (3, -1.5)]]
+    el = solve(path, obs)
+    check_elements(el, [path[0], path[-1]], obs, tol=CHECK_TOL)

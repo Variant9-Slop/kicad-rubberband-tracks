@@ -495,6 +495,7 @@ class _Wrap(NamedTuple):
     sign: float             # +1: path turns left around it
     turn: float | None      # turning of the pull_taut corners it replaces, if any
     at: float               # where along the taut path it comes
+    eased: bool = False     # radius reduced to share a squeeze (see _squeezed)
 
 
 def exact_path(path: Sequence[Pt], obstacles: Iterable[tuple], tol: float = CHECK_TOL,
@@ -619,7 +620,12 @@ def _exact_path(path, obstacles, spare, tol, min_sag, max_rounds) -> list[tuple]
             if short.max() > 0:
                 curve = LineString(pts)
                 k = int(np.argmax(short))
-                p = shapely.ops.nearest_points(curve, check[k])[0]
+                p, q = shapely.ops.nearest_points(curve, check[k])
+                j = _squeezed(wraps, p, q, short[k] + tol, tol)
+                if j is not None:
+                    w = wraps[j]
+                    wraps[j] = w._replace(radius=w.radius - (short[k] + tol) / 2, eased=True)
+                    continue
                 f = feature(k, (p.x, p.y), side_end=True)
                 if f is None:
                     raise RubberBandError("would cut into an obstacle side", (p.x, p.y))
@@ -637,6 +643,25 @@ def _exact_path(path, obstacles, spare, tol, min_sag, max_rounds) -> list[tuple]
                 continue
         return elements
     raise RubberBandError("no clean path found", start)
+
+
+def _squeezed(wraps, p, q, lack, tol):
+    """The wrap to ease if the path, at p, is `lack` too close to q because it goes round
+    that wrap on the far side, and the gap is at most 2 tol too narrow for both: neighbours
+    may each have been left up to tol closer than asked. Easing it by half the lack leaves
+    both sides within tol; keeping one side exact would put all of it on the other."""
+    if lack > 2 * tol:
+        return None
+    p, q = np.array([p.x, p.y]), np.array([q.x, q.y])
+    out = q - p
+    if np.hypot(*out) == 0:
+        return None
+    for j, w in enumerate(wraps):
+        r = p - w.centre
+        if not w.eased and abs(np.hypot(*r) - w.radius) <= 1.0 and \
+                np.dot(r, out) > 0.9 * np.hypot(*r) * np.hypot(*out):
+            return j
+    return None
 
 
 def _shortfall(elements, check, coarse, keep, tol):

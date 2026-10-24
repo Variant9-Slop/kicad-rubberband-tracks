@@ -49,7 +49,9 @@ and extent when `geom` is a band standing in for an arc.
    between wraps (`_tangent`; nearly touching circles switch where they touch or cross,
    never via a µm sliver). Check against the true shapes (arcs sampled to 0.1 nm,
    `CHECK_TOL` 5 nm): add the feature a piece cuts into, drop a wrap whose sweep went
-   negative, repeat. Arcs under `ARC_MIN_SAGITTA` (3 nm) off their chord become a corner.
+   negative, repeat. A squeeze (too close to one side while going round a wrap on the
+   other, ≤ 2·`CHECK_TOL` short: neighbours may each be up to tol closer than asked) eases
+   that wrap by half the shortfall, once (`_squeezed`), so both sides end within tol. Arcs under `ARC_MIN_SAGITTA` (3 nm) off their chord become a corner.
 3. `keep` = `d` if the original was within `SNAP_TOL` (2 µm) of it, else the original's
    distance (never tighter than the original); capped by the fixed ends' distance. So
    re-running on tracks a hair too close (older versions) puts them right.
