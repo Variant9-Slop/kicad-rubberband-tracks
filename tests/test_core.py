@@ -291,3 +291,15 @@ def test_exact_random_obstacle_fields():
         assert path_length(sample_elements(el)) <= path_length(pts) + 1
         done += 1
     assert done >= 40
+
+
+def test_reference_keeps_full_clearance_despite_creep():
+    # A neighbour the path has crept 3 um inside of over repeated passes: with the
+    # original gap as reference the result is put back at the full clearance (without it,
+    # 3 um closer than the rule would pass as "the original was already closer").
+    via = Point(5 * MM, 0)
+    taut = pull_taut(mm([(0, 0), (0, 3), (10, 3), (10, 0)]), [Ob(via, 1 * MM - 3000)])
+    el = exact_path(taut, [Ob(via, 1 * MM, 1 * MM)])
+    assert exact_margin(el, [Ob(via, 1 * MM)]) >= 0
+    crept = exact_path(taut, [Ob(via, 1 * MM)])           # default: the current distance
+    assert exact_margin(crept, [Ob(via, 1 * MM)]) < -2000

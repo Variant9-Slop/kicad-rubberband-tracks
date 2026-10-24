@@ -20,6 +20,9 @@ shortest path of the same topology (same side of every obstacle).
 - Tests: `pytest` (needs `kicad-python`, `shapely`, `numpy`, `pytest`).
 - Package: `python scripts/build_pcm.py`.
 - Debug in KiCad: `KICAD_ENABLE_WXTRACE=1 WXTRACE=KICAD_API kicad`.
+- Real board, offline: `python scripts/check_board.py <in.kicad_pcb> <out.kicad_pcb>` runs
+  the plugin on all tracks via pcbnew (no KiCad running) and DRCs the result with
+  kicad-cli. Work on a copy of the user's board; never write their files.
 
 ## Algorithm (core)
 
@@ -56,7 +59,11 @@ not at all (neighbours are fitted against what a run is, so that must be what ge
 written): if it fixes a violation, has fewer pieces and is not longer, is > 1 µm shorter
 without more pieces, or is > `BIG_GAIN` shorter. Accepting requeues the neighbours. A
 failed redo keeps the last accepted result. Dynamic arcs are coarse bands (topology
-only); the exact check uses the true arcs.
+only); the exact check uses the true arcs. Neighbours' `ref`: pull_taut gets none (the
+current distance; its input must stay outside the grown obstacles), exact_path gets the
+gap between the two original routes: with the current distance, coarse polygons let
+repeated redos creep a little closer each time until it passed as "original closer"
+(2.5 µm violations on a real board).
 
 Plugin: pads are exact shapes from the pad stack (circle/oval/rect/roundrect: skeleton +
 corner radius), used only if they match KiCad's polygon (Hausdorff ≤ 2·`PAD_POLY_ERROR`),

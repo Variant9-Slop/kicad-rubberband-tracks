@@ -516,18 +516,22 @@ class RubberBand:
         return result
 
     # ---------------------------------------------------------- run
-    def _dynamic(self, ch) -> list[Ob]:
-        """The other selected runs next to `ch`, as obstacles where they are now."""
+    def _dynamic(self, ch, exact=False) -> list[Ob]:
+        """The other selected runs next to `ch`, as obstacles where they are now. For
+        pull_taut they may be as close as they are now (its input has to stay outside its
+        grown obstacles); for the exact path only as close as the two original routes were,
+        or else repeated redos could creep closer and closer."""
         out = []
         for other in ch["neighbours"]:
             cl = max(self.clearance[ch["net"]], self.clearance[other["net"]])
             d = other["width"] / 2 + cl + ch["width"] / 2 + EXTRA_MARGIN
+            ref = ch["orig_gap"][id(other)] if exact else None
             for e in other["elements"]:
                 arc = element_arc(e) if e[0] == "arc" else None
                 if arc is None:
-                    out.append(Ob(LineString([e[1], e[-1]]), d))
+                    out.append(Ob(LineString([e[1], e[-1]]), d, ref))
                 else:
-                    out.append(Ob(arc_band(arc, ARC_MAX_ERROR), d, None, arc))
+                    out.append(Ob(arc_band(arc, ARC_MAX_ERROR), d, ref, arc))
         return out
 
     def _report(self, ch, e):
@@ -590,7 +594,7 @@ class RubberBand:
             elements = _item_elements(items, pts[0])
             chains.append(dict(layer=layer, net=net, width=width, items=items, orig=list(pts),
                                cur=list(pts), orig_elements=elements, elements=elements, new=False,
-                               static=static, region=region, error=None, neighbours=[]))
+                               static=static, region=region, error=None, neighbours=[], orig_gap={}))
 
         # neighbours = other-net runs on the same layer that can affect this one
         if chains:
@@ -600,6 +604,7 @@ class RubberBand:
                     other = chains[int(j)]
                     if other is not ch and other["layer"] == ch["layer"] and other["net"] != ch["net"]:
                         ch["neighbours"].append(other)
+                        ch["orig_gap"][id(other)] = LineString(ch["orig"]).distance(LineString(other["orig"]))
 
         # Each run is an obstacle for its neighbours: when one gets shorter, the runs next to
         # it are redone, until nothing changes. A change has to gain over 1 um, so this ends;
@@ -631,7 +636,8 @@ class RubberBand:
                 if path_length(ipts) > path_length(ch["cur"]) + 2:     # longer, beyond rounding
                     continue
                 if USE_ARCS:
-                    exact = exact_path([(float(x), float(y)) for x, y in ipts], obstacles)
+                    exact = exact_path([(float(x), float(y)) for x, y in ipts],
+                                       ch["static"] + self._dynamic(ch, exact=True))
                 else:
                     exact = [("line", a, b) for a, b in zip(ipts, ipts[1:])]
                 elements = self._rounded(exact, ch["orig"][0], ch["orig"][-1])
