@@ -44,6 +44,7 @@ PAD_POLY_ERROR = 5_000         # KiCad's own polygon approximation error for rou
 QUAD_SEGS = 32                 # circle resolution for Edge.Cuts circles
 USE_ARCS = True                # round the corners around vias, pad corners etc. with arcs
 ARC_MARGIN = 1_000             # arcs keep this much more than the clearance (falls back to 0 if tight)
+MIN_SEGMENT = 10_000           # a result with a shorter straight piece is a sliver: run left as is
 
 
 def _xy(v: Vector2) -> tuple[int, int]:
@@ -466,7 +467,9 @@ class RubberBand:
         return out
 
     def _elements(self, ch) -> list[tuple]:
-        """Integer ("line", a, b) / ("arc", a, mid, b) pieces for the final path of `ch`."""
+        """Integer ("line", a, b) / ("arc", a, mid, b) pieces for the final path of `ch`.
+        Raises RubberBandError when it doesn't come out clean (arcs don't fit, or there
+        would be slivers): better to leave the run alone than to write a mess."""
         pts = ch["cur"]
         lines = [("line", a, b) for a, b in zip(pts, pts[1:])]
         if not USE_ARCS:
@@ -478,10 +481,10 @@ class RubberBand:
                 el = fit_arcs([(float(x), float(y)) for x, y in pts], ch["static"] + dynamic, margin,
                               inside=inside, circles=ch["circles"] + [None] * len(dynamic))
                 break
-            except RubberBandError:
-                continue
+            except RubberBandError as e:
+                error = e
         else:
-            return lines        # arcs don't fit; the segments are known to be good
+            raise RubberBandError(f"left as is, arcs don't fit ({error})", error.where)
 
         # round once, so neighbouring pieces share their end points exactly
         r = lambda p: (int(round(p[0])), int(round(p[1])))
@@ -496,6 +499,10 @@ class RubberBand:
                 mid = None      # mid < 1.5 nm off the chord: rounding would bend it any which way
             out.append(("arc", cur, mid, end) if mid else ("line", cur, end))
             cur = end
+        for e in out:
+            if len(out) > 1 and e[0] == "line" and math.dist(e[1], e[2]) < MIN_SEGMENT:
+                raise RubberBandError(f"left as is, it would need a {math.dist(e[1], e[2]) / 1000:.1f} um "
+                                      "straight piece", e[1])
         return out
 
     def run(self):
@@ -571,7 +578,15 @@ class RubberBand:
                 self.messages.append(f"Net '{ch['net'] or '<no net>'}' on {self.board.get_layer_name(ch['layer'])} "
                                      f"near ({x / 1e6:.3f}, {y / 1e6:.3f}) mm: {e}")
             # replace the run if it gets shorter, or comes out in fewer pieces
-            elements = self._elements(ch)
+            try:
+                elements = self._elements(ch)
+            except RubberBandError as e:
+                if ch["error"] is None:
+                    x, y = e.where if e.where else ch["orig"][0]
+                    self.messages.append(f"Net '{ch['net'] or '<no net>'}' on "
+                                         f"{self.board.get_layer_name(ch['layer'])} "
+                                         f"near ({x / 1e6:.3f}, {y / 1e6:.3f}) mm: {e}")
+                continue
             if path_length(ch["cur"]) >= path_length(ch["orig"]) - 1000 and len(elements) >= len(ch["items"]):
                 continue
             to_remove.extend(ch["items"])

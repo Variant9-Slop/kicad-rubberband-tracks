@@ -39,7 +39,9 @@ shortest path of the same topology (same side of every obstacle).
    `ARC_JOIN_TOL`), become one arc at clearance + `ARC_MARGIN`, joined by exact tangents.
    A fitted circle that then breaks (no tangent, sweep mismatch, clearance) is split back
    into per-point arcs. The plugin tries margin, then 0, then arcs kept inside the
-   segments (runs squeezed between selected neighbours); else the run is written as segments.
+   segments (runs squeezed between selected neighbours). If none fits, or the result has a
+   straight piece under `MIN_SEGMENT`, the run is left as it was and reported: never write
+   the intermediate polyline (it is as fine as the polygons, i.e. slivers).
    Arcs under `ARC_MIN_SAGITTA` (3 nm) off their chord would be warped by rounding to nm;
    they become one corner where the tangents meet (bends of under ~0.5°).
 

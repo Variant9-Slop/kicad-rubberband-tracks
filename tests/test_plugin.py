@@ -302,3 +302,30 @@ def test_needed_slight_corner_stays(tmp_path):
     b = MockBoard(tmp_path, tracks=other + segs, selection=segs,
                   pads=[pad(0, -0.45, "A", .1), pad(end[0], end[1], "A", .1)])
     assert run(b).messages == ["Nothing to change: selection is already taut."]
+
+
+def test_run_without_clean_result_is_left_alone(tmp_path, monkeypatch):
+    # If arcs can't be fitted, the run stays as it was and the popup says where; it is
+    # never written as the intermediate segments.
+    def fail(*a, **k):
+        raise rubberband_action.RubberBandError("test", (5e6, 1e6))
+    monkeypatch.setattr(rubberband_action, "fit_arcs", fail)
+    b, _ = around_via_board(tmp_path)
+    msgs = run(b).messages
+    assert b.created == [] and b.removed == []
+    assert len(msgs) == 1 and "left as is" in msgs[0] and "(5.000, 1.000)" in msgs[0]
+
+
+def test_sliver_result_is_left_alone(tmp_path, monkeypatch):
+    # A result with a straight piece under MIN_SEGMENT is a sliver: not written.
+    real = rubberband_action.fit_arcs
+
+    def with_sliver(*a, **k):
+        el = real(*a, **k)
+        (_, p, q), rest = el[0], el[1:]
+        m = (p[0] + (q[0] - p[0]) * 0.999, p[1] + (q[1] - p[1]) * 0.999)
+        return [("line", p, m), ("line", m, q)] + rest
+    monkeypatch.setattr(rubberband_action, "fit_arcs", with_sliver)
+    b, _ = around_via_board(tmp_path)
+    msgs = run(b).messages
+    assert b.created == [] and "straight piece" in msgs[0]

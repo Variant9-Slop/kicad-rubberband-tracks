@@ -27,8 +27,9 @@ Run DRC and refill zones afterwards.
 - A run that can't get shorter is still replaced if it comes out in fewer pieces: a
   straight line with a slight notch, or a curve drawn as many short segments.
 - Bends around vias, holes, pad corners (sharp or rounded) and track ends become arcs at
-  the required clearance plus 1 µm, joined by straight tangents. Where arcs would not fit,
-  that run keeps straight segments (`USE_ARCS = False` turns arcs off).
+  the required clearance plus 1 µm, joined by straight tangents. A run that doesn't come
+  out clean (arcs don't fit, or a straight piece under 10 µm) is left as it was and listed
+  in the popup with its location (`USE_ARCS = False` turns arcs off).
 
 Settings are at the top of `plugin/rubberband_action.py`.
 
