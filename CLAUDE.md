@@ -86,7 +86,8 @@ Units are nanometres throughout (KiCad's internal unit).
   instead: create new tracks, then remove old ones (two undo steps).
 - kipy's default request timeout is 2 s; the client is created with `API_TIMEOUT_MS`.
 - Only one run at a time (`_single_instance`, an OS file lock): two at once both write.
-  Progress window and Cancel are tkinter (`_Progress`), silently absent without it.
+  Progress window, Cancel and message boxes are wxPython (`_Progress`, `_notify`): it ships
+  with KiCad (tkinter does not: a separate OS package). Silently absent without it.
 - Shapely buffers are polygons whose edges fall inside the true offset; `_BUF_SCALE`
   compensates (GEOS steps can be ~1.5× the nominal angle — measured, don't lower it).
 - Board rules (hole/edge/min clearance) aren't exposed by the KiCad 10 API; they are read

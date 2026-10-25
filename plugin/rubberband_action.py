@@ -724,64 +724,77 @@ class _NoProgress:
         pass
 
 
+def _wx_app():
+    """The wx.App (wxPython ships with KiCad); None if wx is unavailable."""
+    try:
+        import wx
+        return wx.GetApp() or wx.App(False)
+    except Exception:
+        return None
+
+
 class _Progress(_NoProgress):
-    """A small window with a progress bar and Cancel (tkinter; nothing if unavailable)."""
+    """A small window with a progress bar and Cancel (wxPython; nothing if unavailable)."""
 
     def __init__(self):
-        self.root, self._last = None, 0.0
+        self.frame, self._last = None, 0.0
         try:
-            import tkinter
-            from tkinter import ttk
-            root = tkinter.Tk()
-            root.title("Rubber band")
-            root.resizable(False, False)
-            root.attributes("-topmost", True)
-            frame = ttk.Frame(root, padding=12)
-            frame.pack()
-            self.label = ttk.Label(frame, text="", width=46)
-            self.label.pack(anchor="w")
-            self.detail = ttk.Label(frame, text="", width=46)
-            self.detail.pack(anchor="w")
-            self.bar = ttk.Progressbar(frame, length=340, maximum=1.0)
-            self.bar.pack(pady=8)
-            ttk.Button(frame, text="Cancel", command=self._cancel).pack(anchor="e")
-            root.protocol("WM_DELETE_WINDOW", self._cancel)
-            self.root = root
+            import wx
+            self.app = _wx_app()
+            frame = wx.Frame(None, title="Rubber band",
+                             style=wx.CAPTION | wx.CLOSE_BOX | wx.SYSTEM_MENU | wx.STAY_ON_TOP)
+            panel = wx.Panel(frame)
+            box = wx.BoxSizer(wx.VERTICAL)
+            self.label = wx.StaticText(panel, size=(360, -1), style=wx.ST_NO_AUTORESIZE)
+            self.detail = wx.StaticText(panel, size=(360, -1), style=wx.ST_NO_AUTORESIZE)
+            self.bar = wx.Gauge(panel, range=1000, size=(360, -1))
+            cancel = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+            cancel.Bind(wx.EVT_BUTTON, self._cancel)
+            frame.Bind(wx.EVT_CLOSE, self._cancel)
+            box.Add(self.label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
+            box.Add(self.detail, 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
+            box.Add(self.bar, 0, wx.ALL, 12)
+            box.Add(cancel, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+            panel.SetSizer(box)
+            box.Fit(frame)
+            frame.Centre()
+            frame.Show()
+            self.frame = frame
         except Exception:
-            self.root = None
+            self.frame = None
 
-    def _cancel(self):
+    def _cancel(self, _event=None):
         self.cancelled = True
         self.show("Cancelling…")
 
     def show(self, text, fraction=None, detail=None):
         """`detail`: a second line (the total length); None leaves it as it is."""
-        if self.root is None:
+        if self.frame is None:
             return
         now = time.monotonic()
         if fraction is not None and 0 < fraction < 1 and now - self._last < 0.05:
             return
         self._last = now
         try:
-            self.label.config(text=text)
+            self.label.SetLabel(text)
             if detail is not None:
-                self.detail.config(text=detail)
-            self.bar.config(mode="determinate" if fraction is not None else "indeterminate")
+                self.detail.SetLabel(detail)
             if fraction is not None:
-                self.bar["value"] = fraction
+                self.bar.SetValue(int(round(fraction * 1000)))
             else:
-                self.bar.step(0.05)
-            self.root.update()
+                self.bar.Pulse()
+            self.app.Yield(True)    # draw, and let Cancel be clicked
         except Exception:
-            self.root = None
+            self.frame = None
 
     def close(self):
-        if self.root is not None:
+        if self.frame is not None:
             try:
-                self.root.destroy()
+                self.frame.Destroy()
+                self.app.Yield(True)
             except Exception:
                 pass
-            self.root = None
+            self.frame = None
 
 
 def _single_instance():
@@ -804,12 +817,9 @@ def _single_instance():
 def _notify(msg: str):
     print(msg, file=sys.stderr)
     try:
-        import tkinter
-        from tkinter import messagebox
-        root = tkinter.Tk()
-        root.withdraw()
-        messagebox.showinfo("Rubber band", msg)
-        root.destroy()
+        import wx
+        if _wx_app() is not None:
+            wx.MessageBox(msg, "Rubber band", wx.OK | wx.ICON_INFORMATION)
     except Exception:
         pass
 
